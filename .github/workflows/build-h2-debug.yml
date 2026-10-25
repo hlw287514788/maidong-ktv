@@ -67,6 +67,17 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME"
           ls "$ANDROID_HOME" | head -20
 
+      # Upstream 2.1.2 has no committed gradle.properties (it is
+      # gitignored upstream), so android.useAndroidX defaults to false
+      # in a clean CI checkout, while the app depends on AndroidX
+      # (media3, appcompat). The author must build with a local
+      # gradle.properties. Create the CI equivalent here; this does
+      # not change any app source.
+      - name: Create gradle.properties for CI (enable AndroidX)
+        run: |
+          printf 'android.useAndroidX=true\n' > upstream/gradle.properties
+          cat upstream/gradle.properties
+
       - name: Build debug APK
         working-directory: upstream
         run: |
