@@ -132,10 +132,38 @@ index e5b0b89..5df68bf 100644
          PersonalMediaStore.init(this)
          CatalogAssets.init(this)
 diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
-index 223d3d0..40598a5 100644
+index 223d3d0..ac3fda3 100644
 --- a/app/src/main/java/com/local/ktv/MainActivity.kt
 +++ b/app/src/main/java/com/local/ktv/MainActivity.kt
-@@ -9206,20 +9206,31 @@ class MainActivity : AppCompatActivity() {
+@@ -5652,7 +5652,15 @@ class MainActivity : AppCompatActivity() {
+ 
+     private fun refreshLibraryImpl(after: Runnable?, scanOpenList: Boolean) {
+         busy(true, if (scanOpenList) "正在扫描网盘歌曲..." else "正在扫描曲库...")
+-        io.execute {
++        // H2 fix: after onDestroy shuts the io executor down, a pending
++        // callback can still call this and get RejectedExecutionException
++        // on the main thread (seen in crash.log). Fail softly instead.
++        if (io.isShutdown) {
++            busy(false, "曲库刷新失败，请重试")
++            return
++        }
++        try {
++            io.execute {
+             val result = runCatching {
+                 val locals = library.scanLocal().size
+                 library.loadCachedRemote()
+@@ -5672,6 +5680,10 @@ class MainActivity : AppCompatActivity() {
+                 }
+             }
+         }
++        } catch (e: java.util.concurrent.RejectedExecutionException) {
++            Log.w(TAG, "曲库刷新失败：线程池已关闭", e)
++            busy(false, "曲库刷新失败，请重试")
++        }
+     }
+ 
+     private fun showCatalogDialog() {
+@@ -9206,20 +9218,34 @@ class MainActivity : AppCompatActivity() {
              progress = SongOkDownloadManager.transferStatus(song)?.first ?: task?.progress ?: 0,
          )
      }
@@ -168,7 +196,10 @@ index 223d3d0..40598a5 100644
 -            else -> addToQueue(song)
 +            persistRuntimeState()
 +            if (!rendered) renderSongList()
-+        } catch (e: Exception) {
++        } catch (e: Throwable) {
++            // Catch Throwable, not just Exception: NoClassDefFoundError and
++            // other Errors must also become a toast + crash.log entry,
++            // never an app crash on tap.
 +            Log.e(TAG, "点歌失败: ${song.title}", e)
 +            CrashRecorder.record("handleSongPrimary ${song.title}", e)
 +            runCatching { toast("点歌失败，请重试：${e.message}") }
@@ -178,7 +209,7 @@ index 223d3d0..40598a5 100644
      }
  
      private fun moveQueuedSongToNext(song: Song) {
-@@ -9427,9 +9438,22 @@ class MainActivity : AppCompatActivity() {
+@@ -9427,9 +9453,22 @@ class MainActivity : AppCompatActivity() {
      }
  
      /**
@@ -191,7 +222,7 @@ index 223d3d0..40598a5 100644
      private fun addToQueue(song: Song) {
 +        try {
 +            addToQueueInternal(song)
-+        } catch (e: Exception) {
++        } catch (e: Throwable) {
 +            Log.e(TAG, "点歌失败: ${song.title}", e)
 +            CrashRecorder.record("addToQueue ${song.title}", e)
 +            runCatching { toast("点歌失败，请重试：${e.message}") }
@@ -202,3 +233,51 @@ index 223d3d0..40598a5 100644
          if (orderQueue!!.contains(song)) {
              toast("已在列表中: " + song.title)
              return
+diff --git a/app/src/main/java/com/local/ktv/SingerAvatarLoader.kt b/app/src/main/java/com/local/ktv/SingerAvatarLoader.kt
+index f0adb39..6e0ae60 100644
+--- a/app/src/main/java/com/local/ktv/SingerAvatarLoader.kt
++++ b/app/src/main/java/com/local/ktv/SingerAvatarLoader.kt
+@@ -39,7 +39,18 @@ object SingerAvatarLoader {
+             return
+         }
+ 
+-        val waiters = waiting.computeIfAbsent(key) { CopyOnWriteArrayList() }
++        // H2 / Android 6.0 fix: Map.computeIfAbsent is API 24+ only and
++        // crashes on API 23 with NoClassDefFoundError for its synthetic
++        // lambda class (seen in crash.log on the singer grid). Use plain
++        // get/put under synchronization instead.
++        val waiters = synchronized(waiting) {
++            var list = waiting[key]
++            if (list == null) {
++                list = CopyOnWriteArrayList()
++                waiting[key] = list
++            }
++            list
++        }
+         waiters += WeakReference(view)
+         if (waiters.size > 1) return
+         val cacheDir = File(view.context.applicationContext.cacheDir, "singer_avatars").apply { mkdirs() }
+diff --git a/app/src/main/java/com/local/ktv/SongOkDownloadManager.kt b/app/src/main/java/com/local/ktv/SongOkDownloadManager.kt
+index aff1299..80c0f09 100644
+--- a/app/src/main/java/com/local/ktv/SongOkDownloadManager.kt
++++ b/app/src/main/java/com/local/ktv/SongOkDownloadManager.kt
+@@ -146,8 +146,17 @@ object SongOkDownloadManager {
+         val job=Job(getLocalFile(song).name, source = source, cloud = cloud, copyExisting = copyExisting)
+         callback?.let(job.callbacks::add)
+         var existing: Job? = null
+-        jobs.compute(id) { _, old ->
+-            if(old != null && !old.cancelled.get()) { existing=old; old } else job
++        // H2 / Android 6.0 fix: Map.compute is API 24+ only. On API 23 the
++        // R8-generated lambda class for it fails to load with
++        // NoClassDefFoundError, crashing the app on tap. Use plain
++        // get/put instead; download() is @Synchronized, so this is safe.
++        synchronized(jobs) {
++            val old = jobs[id]
++            if (old != null && !old.cancelled.get()) {
++                existing = old
++            } else {
++                jobs[id] = job
++            }
+         }
+         if(existing != null) { callback?.let(existing!!.callbacks::add); callback?.onDownloadStart(song); return }
+         io.execute {
