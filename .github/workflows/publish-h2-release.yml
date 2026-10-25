@@ -9,6 +9,10 @@ name: Publish H2 release
 
 on:
   workflow_dispatch:
+    push:
+      branches: [h2-android6-fix]
+      paths:
+        - .github/workflows/publish-h2-release.yml
 
 permissions:
   contents: write
