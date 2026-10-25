@@ -1,4 +1,4 @@
-# Publish the H2 formal release APK (built by run 40206234870) as a GitHub Release.
+# Publish the H2 formal release APK (built by run 40209936045) as a GitHub Release.
 #
 # Why this workflow exists: the browser cannot download Actions artifacts
 # (its file transfer returns unknown for every artifact), so a Release
@@ -20,12 +20,12 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Download release APK artifact from run 40206234870
+      - name: Download release APK artifact from run 40209936045
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p apk
-          gh run download 40206234870 --name maidong-h2-release --dir apk --repo hlw287514788/maidong-ktv
+          gh run download 40209936045 --name maidong-h2-release --dir apk --repo hlw287514788/maidong-ktv
           ls -l apk
           mv apk/app-release.apk maidong-2.1.3.apk
           ls -l maidong-2.1.3.apk
