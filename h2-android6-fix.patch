@@ -35,6 +35,41 @@ index a2fe093..129bcb7 100644
          }
      }
  
+diff --git a/app/src/main/java/com/local/ktv/AppUpdateManager.kt b/app/src/main/java/com/local/ktv/AppUpdateManager.kt
+index 9264d84..83f5419 100644
+--- a/app/src/main/java/com/local/ktv/AppUpdateManager.kt
++++ b/app/src/main/java/com/local/ktv/AppUpdateManager.kt
+@@ -11,10 +11,10 @@ import java.io.FileOutputStream
+ import java.net.HttpURLConnection
+ import java.net.URL
+ 
+-/** Gitee Release based in-app updater. */
++/** GitHub Release based in-app updater (user's own repo, not upstream Gitee). */
+ object AppUpdateManager {
+     private const val LATEST_RELEASE_API =
+-        "https://gitee.com/api/v5/repos/yangyachao-X/maidong-ktv/releases/latest"
++        "https://api.github.com/repos/hlw287514788/maidong-ktv/releases/latest"
+ 
+     data class Release(
+         val version: String,
+@@ -54,7 +54,7 @@ object AppUpdateManager {
+                     apkName = apkName,
+                 )
+             })
+-        }, "gitee-update-check").start()
++        }, "github-update-check").start()
+     }
+ 
+     fun download(
+@@ -105,7 +105,7 @@ object AppUpdateManager {
+                 require(partial.renameTo(target)) { "无法保存安装包" }
+                 target
+             })
+-        }, "gitee-update-download").start()
++        }, "github-update-download").start()
+     }
+ 
+     /**
 diff --git a/app/src/main/java/com/local/ktv/CrashRecorder.kt b/app/src/main/java/com/local/ktv/CrashRecorder.kt
 new file mode 100644
 index 0000000..4c1232d
