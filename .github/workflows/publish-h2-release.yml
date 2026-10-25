@@ -5,6 +5,7 @@
 # cannot be created by uploading the APK from a browser session. This
 # workflow downloads the artifact inside the runner with the GitHub CLI
 # and creates the Release there, where the file is local.
+# trigger test
 name: Publish H2 release
 
 on:
