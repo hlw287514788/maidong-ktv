@@ -1,0 +1,121 @@
+# Build a RELEASE APK for XGIMI H2 (Android 6.0) from upstream 2.1.2 + H2 fix.
+#
+# This is the formal (non-debug) build: package com.local.ktv (no ".qa"
+# suffix), signed with a new keystore. The debug build on the H2 must be
+# uninstalled before installing this release build, because the package
+# name and signature are different.
+#
+# Update source: the app's in-app updater (patched by
+# h2-android6-fix.patch) checks the GitHub Release API of this repository
+# (hlw287514788/maidong-ktv). For the updater to find a new version, a
+# GitHub Release must exist whose tag version is higher than the APK's
+# versionName, and whose assets include the release APK. This workflow
+# bumps the APK to versionName 2.1.3 / versionCode 6 for the first
+# formal release; later releases must bump the version again.
+#
+# Signing / keystore persistence (important):
+# - The original ktv_keystore.jks is not in any repository, so this
+#   workflow uses a NEW keystore.
+# - If the repository secret KEYSTORE_BASE64 is set, it is decoded to
+#   ktv_keystore.jks and used, so every later build has the SAME
+#   signature and can upgrade over the previous release install.
+# - If the secret is NOT set (first run), a new keystore is generated
+#   in the runner (alias ktv, passwords 123456, matching build.gradle)
+#   and uploaded as a separate artifact named maidong-h2-keystore.
+#   The owner MUST save that keystore file and set it as the
+#   KEYSTORE_BASE64 secret before the next release build, otherwise
+#   the next build will generate a different key and Android will
+#   refuse to install it over the previous release (signature mismatch).
+# - The keystore is never committed to the repository (this repo is
+#   public); it only travels as a private Actions artifact / secret.
+name: Build H2 release APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - h2-android6-fix
+    paths:
+      - .github/workflows/build-h2-release.yml
+      - h2-android6-fix.patch
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this branch (workflow + fix patch)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream 2.1.2 source from Gitee
+        run: |
+          git clone https://gitee.com/yangyachao-X/maidong-ktv.git upstream
+          git -C upstream checkout 33f31982b6117d4c0bc872aba877071d5a15ac1f
+          git -C upstream log --oneline -1
+
+      - name: Apply H2 Android 6.0 fix patch
+        run: |
+          cp h2-android6-fix.patch upstream/
+          git -C upstream apply --check h2-android6-fix.patch
+          git -C upstream apply h2-android6-fix.patch
+          git -C upstream status --short
+
+      - name: Bump version for formal release (2.1.3 / code 6)
+        run: |
+          sed -i 's/versionCode 5/versionCode 6/' upstream/app/build.gradle
+          sed -i 's/versionName "2.1.2"/versionName "2.1.3"/' upstream/app/build.gradle
+          grep -n 'versionCode\|versionName' upstream/app/build.gradle | head -5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Check Android SDK (preinstalled on runner)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME" | head -20
+
+      - name: Create gradle.properties for CI (enable AndroidX)
+        run: |
+          printf 'android.useAndroidX=true\n' > upstream/gradle.properties
+          cat upstream/gradle.properties
+
+      - name: Prepare signing keystore (secret or newly generated)
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > upstream/ktv_keystore.jks
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+            echo "Using keystore from secret KEYSTORE_BASE64"
+          else
+            keytool -genkeypair -alias ktv -keyalg RSA -keysize 2048 -validity 10000 \
+              -keystore upstream/ktv_keystore.jks -storepass 123456 -keypass 123456 \
+              -dname "CN=MaidongKTV, OU=KTV, O=Maidong, L=Beijing, ST=Beijing, C=CN"
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+            echo "Generated a NEW keystore; it will be uploaded as an artifact - save it and set it as KEYSTORE_BASE64 before the next build"
+          fi
+          ls -l upstream/ktv_keystore.jks
+
+      - name: Build release APK
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidong-h2-release
+          path: upstream/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload newly generated keystore (first run only - SAVE IT)
+        if: steps.keystore.outputs.generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidong-h2-keystore
+          path: upstream/ktv_keystore.jks
+          if-no-files-found: error

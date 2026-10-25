@@ -1,0 +1,92 @@
+# Build a debug APK for XGIMI H2 (Android 6.0) from upstream 2.1.2 + H2 fix.
+#
+# Why this workflow fetches upstream at build time instead of building the
+# files in this repository directly:
+# - This GitHub repository is still at upstream 2.0.1 (commit 5dced99a).
+# - Upstream 2.1.2 (commit 33f31982b6117d4c0bc872aba877071d5a15ac1f) adds
+#   bundled catalog assets (app/src/main/assets/igeba_catalog.db, ~21 MB,
+#   plus singer_portraits.db, ~10 MB) that cannot be pushed through the
+#   text-only Muse GitHub connector, so a full repo sync through that
+#   connector is not possible. The runner clones the public Gitee source
+#   directly, so the binary assets are present, then applies the small
+#   text patch h2-android6-fix.patch from this branch.
+#
+# The patch (4 files, 131 insertions) does:
+# - MainActivity: guard addToQueue / handleSongPrimary so a Java exception
+#   on the song-order tap path becomes a toast + crash.log entry, not a crash
+# - AppPaths.ensureDirectories: directory creation is best-effort, no check()
+# - CrashRecorder (new): uncaught + caught order-path exceptions are
+#   appended to MaidongKTV/crash.log on the device
+#
+# Output is a debug build (applicationIdSuffix ".qa", no release keystore
+# needed; the release signing config references ktv_keystore.jks which is
+# not in the repository). The debug package can be installed alongside
+# any release build for testing on the H2.
+name: Build H2 debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - h2-android6-fix
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this branch (workflow + fix patch)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream 2.1.2 source from Gitee
+        run: |
+          git clone https://gitee.com/yangyachao-X/maidong-ktv.git upstream
+          git -C upstream checkout 33f31982b6117d4c0bc872aba877071d5a15ac1f
+          git -C upstream log --oneline -1
+
+      - name: Apply H2 Android 6.0 fix patch
+        run: |
+          cp h2-android6-fix.patch upstream/
+          git -C upstream apply --check h2-android6-fix.patch
+          git -C upstream apply h2-android6-fix.patch
+          git -C upstream status --short
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # NOTE (2026-10-25 fix): the previous version used
+      # android-actions/setup-android@v3, which tries to install the
+      # obsolete "tools" package via sdkmanager and fails on current
+      # runners ("Failed to find package 'tools'"). GitHub's ubuntu-latest
+      # runners already ship an Android SDK (ANDROID_HOME is set), and
+      # Gradle picks it up automatically, so no setup step is needed.
+      - name: Check Android SDK (preinstalled on runner)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME" | head -20
+
+      # Upstream 2.1.2 has no committed gradle.properties (it is
+      # gitignored upstream), so android.useAndroidX defaults to false
+      # in a clean CI checkout, while the app depends on AndroidX
+      # (media3, appcompat). The author must build with a local
+      # gradle.properties. Create the CI equivalent here; this does
+      # not change any app source.
+      - name: Create gradle.properties for CI (enable AndroidX)
+        run: |
+          printf 'android.useAndroidX=true\n' > upstream/gradle.properties
+          cat upstream/gradle.properties
+
+      - name: Build debug APK
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidong-h2-debug
+          path: upstream/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
