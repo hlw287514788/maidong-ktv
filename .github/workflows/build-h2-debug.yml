@@ -1,9 +1,9 @@
-# Build a debug APK for XGIMI H2 (Android 6.0) from upstream 2.1.2 + H2 fix.
+# Build a debug APK for XGIMI H2 (Android 6.0) from upstream 2.1.4 + H2 fix.
 #
 # Why this workflow fetches upstream at build time instead of building the
 # files in this repository directly:
 # - This GitHub repository is still at upstream 2.0.1 (commit 5dced99a).
-# - Upstream 2.1.2 (commit 33f31982b6117d4c0bc872aba877071d5a15ac1f) adds
+# - Upstream 2.1.4 (commit 6609ca00a50602cd149a7006d244092f933c3de1) adds
 #   bundled catalog assets (app/src/main/assets/igeba_catalog.db, ~21 MB,
 #   plus singer_portraits.db, ~10 MB) that cannot be pushed through the
 #   text-only Muse GitHub connector, so a full repo sync through that
@@ -37,10 +37,10 @@ jobs:
       - name: Check out this branch (workflow + fix patch)
         uses: actions/checkout@v4
 
-      - name: Clone upstream 2.1.2 source from Gitee
+      - name: Clone upstream 2.1.4 source from Gitee
         run: |
           git clone https://gitee.com/yangyachao-X/maidong-ktv.git upstream
-          git -C upstream checkout 33f31982b6117d4c0bc872aba877071d5a15ac1f
+          git -C upstream checkout 6609ca00a50602cd149a7006d244092f933c3de1
           git -C upstream log --oneline -1
 
       - name: Apply H2 Android 6.0 fix patch
@@ -67,7 +67,7 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME"
           ls "$ANDROID_HOME" | head -20
 
-      # Upstream 2.1.2 has no committed gradle.properties (it is
+      # Upstream 2.1.4 has no committed gradle.properties (it is
       # gitignored upstream), so android.useAndroidX defaults to false
       # in a clean CI checkout, while the app depends on AndroidX
       # (media3, appcompat). The author must build with a local
