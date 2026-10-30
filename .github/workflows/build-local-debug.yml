@@ -1,0 +1,98 @@
+# Build a local-only debug APK for XGIMI H2 (Android 6.0).
+#
+# Local-only variant (new branch local-only, separate from h2-android6-fix):
+# - No igeba catalog / download / catalog update, no auto app-update check.
+# - Song sources only: Local (local storage + USB merged), SMB, OpenList.
+# - SMB fully via SMBJ (scan, playback proxy, delete); jcifs removed.
+# - Singer avatars: local MaidongKTV/singer_avatars/ folder first,
+#   letter placeholder fallback, CDN download default OFF.
+# - Playback errors logged to MaidongKTV/playback.log on device.
+#
+# Why this workflow fetches upstream at build time:
+# - This GitHub repository is still at upstream 2.0.1.
+# - Upstream 2.1.4 (commit 6609ca00a50602cd149a7006d244092f933c3de1)
+#   adds bundled catalog assets (app/src/main/assets/igeba_catalog.db,
+#   ~21 MB, plus singer_portraits.db, ~10 MB) that cannot be pushed
+#   through the text-only Muse GitHub connector. The runner clones
+#   the public Gitee source directly, so the binary assets are present,
+#   then applies the patches below.
+#
+# Patch order (do NOT apply smb.patch here; local-only.patch already
+# includes the H2 + SMB + Media3 work on top of the H2 baseline):
+# 1. h2-android6-fix.patch (already in this branch, H2 / API 23 fixes)
+# 2. local-only.patch (cumulative local-only patch, 46 files)
+# 3. Delete the two igeba catalog databases from assets BEFORE building,
+#    otherwise the APK stays ~60 MB. The text patch cannot delete
+#    binary files, so this rm step is required for the size saving.
+#
+# Output is a debug build (applicationIdSuffix ".qa", no release
+# keystore needed). The debug package can be installed alongside
+# any release build for testing on the H2.
+name: Build local debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - local-only
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this branch (workflow + fix patch)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream 2.1.4 source from Gitee
+        run: |
+          git clone https://gitee.com/yangyachao-X/maidong-ktv.git upstream
+          git -C upstream checkout 6609ca00a50602cd149a7006d244092f933c3de1
+          git -C upstream log --oneline -1
+
+      - name: Apply H2 Android 6.0 fix patch
+        run: |
+          cp h2-android6-fix.patch upstream/
+          git -C upstream apply --check h2-android6-fix.patch
+          git -C upstream apply h2-android6-fix.patch
+          git -C upstream status --short
+
+      - name: Apply local-only patch
+        run: |
+          cp local-only.patch upstream/
+          git -C upstream apply --check local-only.patch
+          git -C upstream apply local-only.patch
+          git -C upstream status --short
+
+      - name: Remove igeba catalog databases (local-only, saves ~31 MB)
+        run: |
+          rm -f upstream/app/src/main/assets/igeba_catalog.db upstream/app/src/main/assets/singer_portraits.db
+          ls upstream/app/src/main/assets/
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Check Android SDK (preinstalled on runner)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME" | head -20
+
+      - name: Create gradle.properties for CI (enable AndroidX)
+        run: |
+          printf 'android.useAndroidX=true\n' > upstream/gradle.properties
+          cat upstream/gradle.properties
+
+      - name: Build debug APK
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidong-local-debug
+          path: upstream/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
