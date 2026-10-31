@@ -1,0 +1,178 @@
+# Build a FFmpeg fallback-player debug APK for XGIMI H2 (Android 6.0).
+#
+# Phase-2 step 2 (full fallback player): branch ffmpeg-hw-player,
+# separate from local-only and from h2-android6-fix.
+# - This branch is a continuation of local-only, not a replacement:
+#   it keeps the local-only variant (no igeba catalog / download /
+#   catalog update, no auto app-update check; sources only Local,
+#   SMB, OpenList; SMB scan via SMBJ, playback proxy via jcifs;
+#   playback errors logged to MaidongKTV/playback.log).
+# - On top of local-only it adds ONE manually triggered probe entry
+#   (Settings data section, "FFmpeg 探针"): it opens the local
+#   MaidongKTV/songs/1.TS with FFmpeg avformat, lists its streams,
+#   and reports whether h264_mediacodec exists. It does NOT play,
+#   decode, or render anything, and it never runs automatically.
+#
+# Why this workflow fetches upstream at build time:
+# - This GitHub repository is still at upstream 2.0.1.
+# - Upstream 2.1.4 (commit 6609ca00a50602cd149a7006d244092f933c3de1)
+#   adds bundled catalog assets (app/src/main/assets/igeba_catalog.db,
+#   ~21 MB, plus singer_portraits.db, ~10 MB) that cannot be pushed
+#   through the text-only Muse GitHub connector. The runner clones
+#   the public Gitee source directly, so the binary assets are present,
+#   then applies the patches below.
+# - Upstream 2.1.4 also ships third_party/ffmpeg/ (ffmpeg-kit-full
+#   6.0.LTS, LGPL). The probe links only avformat / avcodec / avutil
+#   from that tree; no FFmpeg binary is added by any text patch and
+#   no FFmpeg package is downloaded from an external site here.
+#
+# Patch order (do NOT merge probe-app.patch into local-only.patch):
+# 1. h2-android6-fix.patch (already in this branch, H2 / API 23 fixes)
+# 2. local-only.patch (cumulative local-only patch, 46 files, 8710 lines)
+# 3. probe-app.patch (301 lines, 6 files, probe only, applied AFTER
+#    local-only.patch; it was verified on a copy of the local-only tree)
+# 4. player-app.patch (5 files, probe+player: probe module stays, player
+#    module appended to the same Android.mk; MainActivity fallback wired)
+# 4. Delete the two igeba catalog databases from assets BEFORE building,
+#    otherwise the APK stays ~60 MB. The text patch cannot delete
+#    binary files, so this rm step is required for the size saving.
+# 5. Verify the upstream FFmpeg binaries with the upstream checksums
+#    file BEFORE building. Any mismatch fails the job (fail-stop);
+#    never substitute another FFmpeg package.
+#
+# NDK: probe-app.patch sets ndkVersion "27.0.12077973" (the same
+# version upstream 2.1.4 used) and uses ndkBuild (Android.mk /
+# Application.mk, the system upstream 2.1.4 already used), not CMake.
+# The workflow prefers a preinstalled NDK of exactly that version;
+# only if it is absent does it install that version with the
+# nttld/setup-ndk@v1 action (version pinned below).
+#
+# Output is a debug build (applicationIdSuffix ".qa", no release
+# keystore needed). The artifact name is deliberately different
+# from maidong-local-debug so the probe build cannot be confused
+# with the local-only probe build.
+#
+# NOTE: this workflow file itself cannot be written via the GitHub
+# connector (GitHub API 403: the Muse GitHub App lacks workflows
+# permission). Upload it via the browser to
+# .github/workflows/build-ffmpeg-probe-debug.yml on ffmpeg-hw-player.
+name: Build ffmpeg player APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ffmpeg-hw-player
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this branch (workflow + fix patches)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream 2.1.4 source from Gitee
+        run: |
+          git clone https://gitee.com/yangyachao-X/maidong-ktv.git upstream
+          git -C upstream checkout 6609ca00a50602cd149a7006d244092f933c3de1
+          git -C upstream log --oneline -1
+
+      - name: Apply H2 Android 6.0 fix patch
+        run: |
+          cp h2-android6-fix.patch upstream/
+          git -C upstream apply --check h2-android6-fix.patch
+          git -C upstream apply h2-android6-fix.patch
+          git -C upstream status --short
+
+      - name: Apply local-only patch
+        run: |
+          cp local-only.patch upstream/
+          git -C upstream apply --check local-only.patch
+          git -C upstream apply local-only.patch
+          git -C upstream status --short
+
+      - name: Apply FFmpeg probe patch (after local-only patch)
+        run: |
+          cp probe-app.patch upstream/
+          git -C upstream apply --check probe-app.patch
+          git -C upstream apply probe-app.patch
+          git -C upstream status --short
+
+      - name: Apply FFmpeg player patch (after probe patch)
+        run: |
+          cp player-app.patch upstream/
+          git -C upstream apply --check player-app.patch
+          git -C upstream apply player-app.patch
+          git -C upstream status --short
+
+      - name: Remove igeba catalog databases (local-only, saves ~31 MB)
+        run: |
+          rm -f upstream/app/src/main/assets/igeba_catalog.db upstream/app/src/main/assets/singer_portraits.db
+          ls upstream/app/src/main/assets/
+
+      - name: Verify upstream FFmpeg binaries (fail-stop on mismatch)
+        run: |
+          cd upstream
+          # Upstream checksums.sha256 uses Windows backslash paths, which
+          # sha256sum on Linux cannot read (probe #1 failed exactly here).
+          # Convert backslashes to forward slashes into a Linux copy and
+          # verify that copy; the upstream file itself is untouched and
+          # no FFmpeg package is substituted.
+          sed 's|\\|/|g' third_party/ffmpeg/checksums.sha256 > /tmp/checksums-linux.sha256
+          sha256sum -c /tmp/checksums-linux.sha256
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Check for preinstalled NDK 27.0.12077973
+        run: |
+          if [ -d "$ANDROID_HOME/ndk/27.0.12077973" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+            echo "NDK preinstalled: $ANDROID_HOME/ndk/27.0.12077973"
+          else
+            echo "NDK_NOT_PREINSTALLED=1" >> "$GITHUB_ENV"
+            echo "NDK 27.0.12077973 not preinstalled; will install it below"
+          fi
+
+      - name: Install NDK 27.0.12077973 if not preinstalled
+        if: env.NDK_NOT_PREINSTALLED == '1'
+        run: |
+          # nttld/setup-ndk@v1 fails for this version with HTTP 404
+          # (probe #2): it tries a version-numbered URL, while Google
+          # distributes NDK r27 as android-ndk-r27-linux.zip.
+          # Download r27 directly and unpack it under the exact
+          # versioned path Gradle expects (27.0.12077973).
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+          unzip -q android-ndk-r27-linux.zip
+          mkdir -p "$ANDROID_HOME/ndk/27.0.12077973"
+          cp -a android-ndk-r27/. "$ANDROID_HOME/ndk/27.0.12077973/"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          ls "$ANDROID_HOME/ndk/27.0.12077973" | head -20
+
+      - name: Check Android SDK (preinstalled on runner)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls "$ANDROID_HOME" | head -20
+
+      - name: Create gradle.properties for CI (enable AndroidX)
+        run: |
+          printf 'android.useAndroidX=true\n' > upstream/gradle.properties
+          cat upstream/gradle.properties
+
+      - name: Build debug APK
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload player debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidong-ffmpeg-player-debug
+          path: upstream/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
