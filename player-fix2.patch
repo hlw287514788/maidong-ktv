@@ -1,0 +1,18 @@
+diff --git a/app/src/main/cpp/ffmpeg_hw_player.cpp b/app/src/main/cpp/ffmpeg_hw_player.cpp
+index 9bce891..7ee94ff 100644
+--- a/app/src/main/cpp/ffmpeg_hw_player.cpp
++++ b/app/src/main/cpp/ffmpeg_hw_player.cpp
+@@ -555,8 +555,12 @@ Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeStart(
+     s->mPrepared = env->GetMethodID(cls, "onNativePrepared", "(JIII)V");
+     s->mError = env->GetMethodID(cls, "onNativeError", "(ILjava/lang/String;)V");
+     s->mComplete = env->GetMethodID(cls, "onNativeComplete", "()V");
++    // fix2: Kotlin onNativePcm params are (buffer, sampleRate Int,
++    // channels Int, ptsUs Long), i.e. IIJ. The old signature made
++    // GetMethodID return null, so the first PCM callback from the
++    // audio thread killed the process with no Java crash.log.
+     s->mPcm = env->GetMethodID(cls, "onNativePcm",
+-                              "(Ljava/nio/ByteBuffer;IJI)Z");
++                              "(Ljava/nio/ByteBuffer;IIJ)Z");
+     s->mProgress = env->GetMethodID(cls, "onNativeProgress", "(JJ)V");
+     s->mFirstFrame = env->GetMethodID(cls, "onNativeFirstFrame", "()V");
+     s->vocalMode.store(vocalMode);
