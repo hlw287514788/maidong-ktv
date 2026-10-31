@@ -27,7 +27,7 @@ index 27a683d..6056824 100644
                      (fallbackExt.endsWith(".ts") || fallbackExt.endsWith(".m2ts") ||
                          fallbackExt.endsWith(".mkv") || fallbackExt.endsWith(".webm"))
 +                // 诊断版：只记后缀，不记完整路径（本地只记文件名/后缀）。
-+                playbackLog(song, "FFMPEG_FALLBACK 判定 后缀=" + fallbackExt.substringAfterLast('.', "") + " extra=" + extra + " 解码失败=" + DecoderRecoveryState.isDecoderFailure(extra) + " 已试过=" + (fallbackAttemptedFor == stableId(song)) + " 可进=" + canFallback)
++                playbackLog(song, "FFMPEG_FALLBACK 判定 后缀=" + fallbackExt.substringAfterLast('.', "") + " extra=" + extra + " 解码失败=" + DecoderRecoveryState.isDecoderFailure(extra) + " 已试过=" + (song != null && fallbackAttemptedFor == stableId(song)) + " 可进=" + canFallback)
                  if (canFallback) {
                      fallbackAttemptedFor = stableId(song)
                      song?.let { startFfmpegFallback(it, generation) }
