@@ -1,0 +1,36 @@
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index 73a616c..43ce271 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -4379,6 +4379,11 @@ class MainActivity : AppCompatActivity() {
+                 // 若有此行而无成功/失败行，死在原生启动内。
+                 playbackLog(song, "FFMPEG_FALLBACK 启动前 音轨=" + audioStreams)
+                 val ok = session.start(input, surface, firstAudio, FfmpegHwSession.VOCAL_MODE_STEREO)
++                // fix1: log the return of nativeStart. If this line appears,
++                // nativeStart returned and the crash is in a post-start
++                // native thread; if it does not, the crash is inside
++                // nativeStart itself.
++                playbackLog(song, "FFMPEG_FALLBACK 启动返回 ok=" + ok)
+                 if (!ok) {
+                     playbackPreparing = false
+                     playbackLog(song, "FFMPEG_FALLBACK 失败原因=start_failed")
+diff --git a/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
+index dbbdee7..42f7571 100644
+--- a/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
++++ b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
+@@ -182,9 +182,14 @@ class FfmpegHwSession(
+     // ---- Called from native code. Names/signatures must match the
+     // ---- GetMethodID lookups in ffmpeg_hw_player.cpp exactly. ----
+ 
++    // fix1: do NOT drop onNativePrepared on nativeHandle == 0. nativeStart
++    // calls prepared synchronously before returning, while Kotlin sets
++    // nativeHandle only after nativeStart returns, so the guard would
++    // discard the success callback forever. The caller's generation
++    // check is the second line of defence, and stop() joins the native
++    // threads, so no stale session's prepared can arrive after stop.
+     @Suppress("unused")
+     private fun onNativePrepared(durationMs: Long, width: Int, height: Int, audioStreamCount: Int) {
+-        if (nativeHandle == 0L) return
+         onPrepared(durationMs, width, height, audioStreamCount)
+     }
+ 
