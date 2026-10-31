@@ -1,0 +1,33 @@
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index 27a683d..6056824 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -4201,6 +4201,9 @@ class MainActivity : AppCompatActivity() {
+             randomLocalRequestSerial++
+             stopFfmpegFallback()
+             playbackGeneration++
++            // 诊断版：新点歌时清掉“本首已试过 fallback”标记，否则同一首歌
++            // 第二次点永远进不了 fallback（原代码从来不清这个标记）。
++            fallbackAttemptedFor = null
+             songRetryCount = 0 // 重置重试计数
+             playWhenPrepared = true
+             hidePlaybackNoticeNow()
+@@ -4372,6 +4375,9 @@ class MainActivity : AppCompatActivity() {
+                     onFirstFrame = { },
+                 )
+                 ffmpegFallback = session
++                // 诊断版：原生启动前记一行；若随后闪退且无此行，死在启动之前，
++                // 若有此行而无成功/失败行，死在原生启动内。
++                playbackLog(song, "FFMPEG_FALLBACK 启动前 音轨=" + audioStreams)
+                 val ok = session.start(input, surface, firstAudio, FfmpegHwSession.VOCAL_MODE_STEREO)
+                 if (!ok) {
+                     playbackPreparing = false
+@@ -4801,6 +4807,8 @@ class MainActivity : AppCompatActivity() {
+                     fallbackAttemptedFor != stableId(song) &&
+                     (fallbackExt.endsWith(".ts") || fallbackExt.endsWith(".m2ts") ||
+                         fallbackExt.endsWith(".mkv") || fallbackExt.endsWith(".webm"))
++                // 诊断版：只记后缀，不记完整路径（本地只记文件名/后缀）。
++                playbackLog(song, "FFMPEG_FALLBACK 判定 后缀=" + fallbackExt.substringAfterLast('.', "") + " extra=" + extra + " 解码失败=" + DecoderRecoveryState.isDecoderFailure(extra) + " 已试过=" + (fallbackAttemptedFor == stableId(song)) + " 可进=" + canFallback)
+                 if (canFallback) {
+                     fallbackAttemptedFor = stableId(song)
+                     song?.let { startFfmpegFallback(it, generation) }
