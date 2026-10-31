@@ -1,0 +1,44 @@
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index 43ce271..41d56ef 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -4334,8 +4334,13 @@ class MainActivity : AppCompatActivity() {
+                     playNext()
+                     return@post
+                 }
++                // diag2: log-only — record whether the Surface the fallback
++                // will render into is valid and whether the player view is
++                // currently shown. Read-only; no playback state is changed.
++                playbackLog(song, "FFMPEG_FALLBACK 画面 Surface有效=" + surface.isValid + " 视图可见=" + (player?.isShown == true))
+                 fallbackAudioStreams = audioStreams
+                 val firstAudio = audioStreams.firstOrNull() ?: -1
++                var firstProgressLogged = false
+                 // Native callbacks arrive on native threads, not the main
+                 // thread, so every UI-affecting callback is re-dispatched
+                 // to main before touching views / playNext / generation.
+@@ -4370,9 +4375,24 @@ class MainActivity : AppCompatActivity() {
+                     onProgress = { pos, _ ->
+                         if (generation == playbackGeneration && currentSong === song) {
+                             fallbackPositionMs = pos
++                            // diag2: log-only, first progress report only.
++                            // Progress is only sent after a frame renders,
++                            // so this line also proves a frame rendered.
++                            if (!firstProgressLogged) {
++                                firstProgressLogged = true
++                                playbackLog(song, "FFMPEG_FALLBACK 进度首报 pos=" + pos)
++                            }
++                        }
++                    },
++                    // diag2: log-only — previously empty. Native
++                    // firstFrameReported guarantees a single callback.
++                    onFirstFrame = {
++                        main.post {
++                            if (generation == playbackGeneration && currentSong === song) {
++                                playbackLog(song, "FFMPEG_FALLBACK 首帧已渲染")
++                            }
+                         }
+                     },
+-                    onFirstFrame = { },
+                 )
+                 ffmpegFallback = session
+                 // 诊断版：原生启动前记一行；若随后闪退且无此行，死在启动之前，
