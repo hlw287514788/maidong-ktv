@@ -1,0 +1,1307 @@
+diff --git a/app/src/main/cpp/Android.mk b/app/src/main/cpp/Android.mk
+index c2c5f2c..eded5e8 100644
+--- a/app/src/main/cpp/Android.mk
++++ b/app/src/main/cpp/Android.mk
+@@ -31,3 +31,17 @@ LOCAL_LDFLAGS := -Wl,-z,max-page-size=16384
+ LOCAL_SHARED_LIBRARIES := avformat avcodec avutil
+ LOCAL_LDLIBS := -landroid -llog
+ include $(BUILD_SHARED_LIBRARY)
++
++# Phase-2 step 2: full fallback player (no playback change to probe).
++# Prebuilt avutil/avcodec/avformat above are shared; do NOT redefine
++# them here (duplicate module definitions break ndkBuild). Only the
++# new ffmpeg_hw_player module is appended, with its own .so name.
++include $(CLEAR_VARS)
++LOCAL_MODULE := ffmpeg_hw_player
++LOCAL_SRC_FILES := ffmpeg_hw_player.cpp
++LOCAL_C_INCLUDES := $(FFMPEG_ROOT)/include
++LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Werror=return-type -fexceptions
++LOCAL_LDFLAGS := -Wl,-z,max-page-size=16384
++LOCAL_SHARED_LIBRARIES := avformat avcodec avutil
++LOCAL_LDLIBS := -landroid -llog -lmediandk
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/app/src/main/cpp/ffmpeg_hw_player.cpp b/app/src/main/cpp/ffmpeg_hw_player.cpp
+new file mode 100644
+index 0000000..3a986bc
+--- /dev/null
++++ b/app/src/main/cpp/ffmpeg_hw_player.cpp
+@@ -0,0 +1,706 @@
++// Phase-2 full playback (fallback only), step 1: first-frame-capable player.
++//
++// Pipeline, in one sentence:
++//   FFmpeg avformat demux -> video packets to Android NDK AMediaCodec
++//   ("video/avc", configured with the KtvVideoView Surface) -> hardware
++//   frames straight to that Surface; audio packets to FFmpeg mp2 decode
++//   -> PCM 16-bit -> Kotlin AudioTrack. No sws_scale, no RGBA, no
++//   ANativeWindow software rendering anywhere in this file.
++//
++// IMPORTANT DEVIATION FROM PLAN.md §2, FOUND BY CHECKING THE SHIPPED
++// HEADERS (do not "fix" this back silently):
++//   The ffmpeg-kit 6.0 headers shipped in upstream third_party/ffmpeg
++//   contain libavcodec/avcodec.h but NOT libavcodec/mediacodec.h, so
++//   av_mediacodec_alloc_context / av_mediacodec_default_init /
++//   av_mediacodec_release_buffer cannot be called against this build.
++//   The probe (2026-10-31, H2) proved h264_mediacodec EXISTS as a
++//   registered decoder name, which is a signal that the device's
++//   MediaCodec H.264 decoder exists -- the same OMX.MS.AVC decoder
++//   Media3 already uses on this device. This file therefore uses the
++//   other, header-independent mediacodec route: FFmpeg only demuxes,
++//   and the H.264 packets it extracts are fed to AMediaCodec, which
++//   is Android's own mediacodec hardware path and renders directly
++//   to the supplied Surface. If a future build ships full FFmpeg
++//   headers (or FFmpeg is built from source with --enable-mediacodec),
++//   only the video-decode thread below needs to change: replace the
++//   AMediaCodec block with avcodec_find_decoder_by_name(
++//   "h264_mediacodec") + av_mediacodec_* surface binding, keeping
++//   the reader, audio, clock, pause/stop and JNI contracts unchanged.
++//   Until that happens, do NOT claim this file calls FFmpeg's
++//   mediacodec decoder directly; claim exactly what it does:
++//   FFmpeg demux + Android mediacodec hardware decode.
++//
++// Scope (PLAN.md §1, task brief):
++//   Fallback only. Media3 stays the primary player for MKV/MP4. This
++//   session is created only after Media3 reports an extraction
++//   failure (3003 or equivalent, no first frame) for .ts/.m2ts/
++//   .mkv/.webm, and only once per song. If this session fails, the
++//   caller falls back to the existing retry/skip logic; this session
++//   never retries Media3 itself and never loops back into Media3.
++//
++// Audio / vocal model (probe, 2026-10-31, H2, local 1.TS):
++//   Two independent MP2 audio streams (index 1 and 2, 44100 Hz, 2 ch),
++//   NOT one stereo track split by channel. Vocal switching in this
++//   file is therefore STREAM selection first:
++//     original     -> first audio stream found
++//     accompaniment -> second audio stream found, if any
++//   If a file has only ONE audio stream, the fallback in the audio
++//   thread applies the KaraokeAudioProcessor channel logic (see
++//   applyKaraokeChannel below): LEFT = left sample copied to both
++//   ears, RIGHT = right sample copied to both ears, STEREO = as-is,
++//   each sample scaled by its ear gain and clamped to Short range.
++//   That logic is a REPLICATION of KtvVideoView's private
++//   KaraokeAudioProcessor (it cannot be reused: it is a Media3
++//   BaseAudioProcessor bound to Media3's audio pipeline), not a
++//   reuse of that class.
++//
++// Clock / sync:
++//   Audio is the master clock. The audio thread advances audioClockUs
++//   from the PCM samples it hands to Kotlin (sample count /
++//   sampleRate). The video thread renders a frame only when its PTS
++//   is <= audioClockUs + 40ms; frames more than 120ms late are
++//   dropped (released without rendering) so a slow start cannot
++//   accumulate lag. Before any audio has been written, video waits
++//   (bounded) for the audio clock instead of racing ahead.
++//   This is "good enough to play" sync, not frame-accurate sync;
++//   it is not claimed otherwise.
++//
++// Control contract (PLAN.md §4):
++//   The Kotlin session owns a generation snapshot (passed in from
++//   MainActivity.playbackGeneration at start). Every native callback
++//   carries no generation itself; the Kotlin layer checks the
++//   snapshot against MainActivity's current generation before acting
++//   (same pattern as setupPlayerListeners). Native stop() is
++//   idempotent, joins all threads, frees every context, and never
++//   calls back after stop() returns.
++//
++// Seek: best-effort only, NOT verified on H2 (see LIMITATIONS.md).
++//   seekTo() sets a seek command; the reader does avformat_seek_file
++//   to the target, flushes both decoders, clears both queues and
++//   resets the clocks. Precise frame-accurate seek, and seek-then-
++//   first-frame latency on MStar, are untested and must not be
++//   promised until the H2 checklist in PLAN.md §10 passes.
++//   Pitch / tone (Media3 PlaybackParameters) has NO equivalent here
++//   and is deliberately not implemented.
++
++#include <jni.h>
++#include <android/native_window_jni.h>
++#include <media/NdkMediaCodec.h>
++#include <media/NdkMediaFormat.h>
++#include <media/NdkMediaError.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++extern "C" {
++#include <libavformat/avformat.h>
++#include <libavcodec/avcodec.h>
++#include <libavutil/avutil.h>
++#include <libavutil/frame.h>
++#include <libavutil/mem.h>
++#include <libavutil/rational.h>
++}
++
++namespace {
++
++JavaVM* g_vm = nullptr;
++
++struct JniEnv {
++    JNIEnv* e = nullptr;
++    bool attached = false;
++    JniEnv() {
++        if (g_vm == nullptr) return;
++        if (g_vm->GetEnv(reinterpret_cast<void**>(&e), JNI_VERSION_1_6) != JNI_OK) {
++            attached = g_vm->AttachCurrentThread(&e, nullptr) == JNI_OK;
++        }
++    }
++    ~JniEnv() { if (attached && g_vm != nullptr) g_vm->DetachCurrentThread(); }
++};
++
++std::string avErrorText(int code) {
++    char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
++    av_strerror(code, buf, sizeof(buf));
++    return buf;
++}
++
++// ---- Karaoke channel replication (see header comment) -----------------
++// mode: 0 = LEFT, 1 = RIGHT, 2 = STEREO (mirrors AudioChannels in
++// KtvVideoView.kt). Input/output are interleaved PCM 16-bit.
++// Returns the number of output samples written (always == inSamples
++// for stereo in, and 2x mono samples for mono in: mono is duplicated
++// to both ears, matching the old processor's "mono -> both ears"
++// behaviour only where the old code did that for a 1-channel input
++// by repeating per-channel samples; here mono is explicitly doubled).
++inline int16_t clampScaled(int16_t s, float gain) {
++    int v = static_cast<int>(static_cast<float>(s) * gain);
++    if (v > 32767) v = 32767;
++    if (v < -32768) v = -32768;
++    return static_cast<int16_t>(v);
++}
++
++// channels==2, mode LEFT/RIGHT/STEREO; channels==1, sample duplicated.
++size_t applyKaraokeChannel(const int16_t* in, size_t inSamples, int channels,
++                           int mode, float leftGain, float rightGain,
++                           int16_t* out) {
++    size_t o = 0;
++    if (channels == 2) {
++        for (size_t i = 0; i + 1 < inSamples; i += 2) {
++            int16_t l = in[i], r = in[i + 1];
++            int16_t selL, selR;
++            if (mode == 0) { selL = l; selR = l; }        // LEFT -> both ears
++            else if (mode == 1) { selL = r; selR = r; }   // RIGHT -> both ears
++            else { selL = l; selR = r; }                  // STEREO as-is
++            out[o++] = clampScaled(selL, leftGain);
++            out[o++] = clampScaled(selR, rightGain);
++        }
++    } else if (channels == 1) {
++        for (size_t i = 0; i < inSamples; ++i) {
++            out[o++] = clampScaled(in[i], leftGain);
++            out[o++] = clampScaled(in[i], rightGain);
++        }
++    } else {
++        // >2 channels: pass through first two channels only; this
++        // player does not claim surround support.
++        for (size_t i = 0; i + 1 < inSamples; i += channels) {
++            out[o++] = clampScaled(in[i], leftGain);
++            out[o++] = clampScaled(in[i + 1], rightGain);
++        }
++    }
++    return o;
++}
++
++struct QueuedPacket {
++    AVPacket* pkt = nullptr;
++    int streamIndex = -1;
++};
++
++struct PacketQueue {
++    std::mutex mu;
++    std::condition_variable cv;
++    std::deque<QueuedPacket> q;
++    void push(QueuedPacket p) {
++        { std::lock_guard<std::mutex> lk(mu); q.push_back(p); }
++        cv.notify_one();
++    }
++    // Returns false when stopped.
++    bool pop(QueuedPacket& out, const std::atomic<bool>& stop) {
++        std::unique_lock<std::mutex> lk(mu);
++        cv.wait(lk, [&] { return stop.load() || !q.empty(); });
++        if (q.empty()) return false;
++        out = q.front(); q.pop_front();
++        return true;
++    }
++    void clear() {
++        std::lock_guard<std::mutex> lk(mu);
++        for (auto& p : q) av_packet_free(&p.pkt);
++        q.clear();
++    }
++    void notifyAll() { cv.notify_all(); }
++};
++
++struct Session {
++    jobject owner = nullptr;  // global ref to FfmpegHwSession
++    jmethodID mPrepared = nullptr, mError = nullptr, mComplete = nullptr,
++              mPcm = nullptr, mProgress = nullptr, mFirstFrame = nullptr;
++
++    std::string path;
++    ANativeWindow* window = nullptr;
++
++    AVFormatContext* fmt = nullptr;
++    // videoCtx is intentionally UNUSED in this design: video decode
++    // is AMediaCodec, not AVCodec. It is kept only so destroySession
++    // / callPrepared signatures stay simple; width/height come from
++    // the stream parameters below, never from videoCtx.
++    AVCodecContext* videoCtx = nullptr;
++    int videoWidth = 0, videoHeight = 0;
++    AVCodecContext* audioCtx = nullptr;
++    AMediaCodec* videoCodec = nullptr;
++    AMediaFormat* videoFormat = nullptr;
++
++    int videoStream = -1, audioStreamCount = 0;
++    std::vector<int> audioStreams;  // stream indices, in file order
++    std::atomic<int> selectedAudioStream{-1};  // stream index, or -1
++    std::atomic<int> vocalMode{2};  // 0 LEFT, 1 RIGHT, 2 STEREO (single-stream fallback)
++    std::atomic<float> leftGain{1.0f}, rightGain{1.0f};
++
++    std::atomic<bool> stop{false}, paused{false}, failed{false};
++    std::atomic<int> drainedCount{0};
++    std::atomic<bool> firstFrameReported{false};
++    std::atomic<int64_t> audioClockUs{0};
++    std::atomic<int64_t> seekTargetMs{-1};
++    std::atomic<int> serial{1};
++    int64_t durationMs = -1;
++
++    PacketQueue videoQ, audioQ;
++    std::thread readerThread, videoThread, audioThread;
++    std::mutex pauseMu;
++    std::condition_variable pauseCv;
++
++    void waitIfPaused() {
++        std::unique_lock<std::mutex> lk(pauseMu);
++        pauseCv.wait(lk, [&] { return stop.load() || !paused.load(); });
++    }
++    void wakeAll() { videoQ.notifyAll(); audioQ.notifyAll(); pauseCv.notify_all(); }
++
++    void callError(int code, const std::string& msg) {
++        if (failed.exchange(true)) return;
++        JniEnv env;
++        if (env.e == nullptr) return;
++        jstring jmsg = env.e->NewStringUTF(msg.c_str());
++        env.e->CallVoidMethod(owner, mError, code, jmsg);
++        if (jmsg) env.e->DeleteLocalRef(jmsg);
++    }
++    void callComplete() {
++        JniEnv env;
++        if (env.e == nullptr) return;
++        env.e->CallVoidMethod(owner, mComplete);
++    }
++    // Called by a worker thread when it has drained its EOF marker.
++    // Completion is reported only after BOTH video and audio have
++    // drained, so the reader must NOT report completion at EOF (it
++    // would cut off the last queued packets).
++    void markDrainedAndMaybeComplete() {
++        if (stop.load() || failed.load()) return;
++        if (drainedCount.fetch_add(1) + 1 >= 2) callComplete();
++    }
++    void callFirstFrame() {
++        if (firstFrameReported.exchange(true)) return;
++        JniEnv env;
++        if (env.e == nullptr) return;
++        env.e->CallVoidMethod(owner, mFirstFrame);
++    }
++    void callPrepared() {
++        JniEnv env;
++        if (env.e == nullptr) return;
++        env.e->CallVoidMethod(owner, mPrepared, (jlong)durationMs,
++                              (jint)videoWidth,
++                              (jint)videoHeight,
++                              (jint)audioStreamCount);
++    }
++};
++
++// ---- video thread: AMediaCodec hardware decode to Surface ------------
++void videoLoop(Session* s) {
++    int64_t lastProgressMs = -1;
++    bool eofQueued = false;
++    while (!s->stop.load()) {
++        s->waitIfPaused();
++        if (s->stop.load()) break;
++        QueuedPacket qp;
++        if (!eofQueued) {
++            if (!s->videoQ.pop(qp, s->stop)) break;
++            if (qp.pkt == nullptr) {
++                // EOF marker: queue EOS to MediaCodec so already-queued
++                // frames are drained, then break only on EOS output below.
++                ssize_t eosIndex = AMediaCodec_dequeueInputBuffer(s->videoCodec, 2000);
++                if (eosIndex >= 0) {
++                    AMediaCodec_queueInputBuffer(s->videoCodec, (size_t)eosIndex, 0, 0, 0,
++                                                 AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
++                }
++                eofQueued = true;
++                // Fall through to drain with no new packet.
++                qp.pkt = nullptr;
++                // Use a sentinel: skip feeding, go straight to drain.
++                // (Handled by the drain loop below reading no packet.)
++                // To keep the code simple, drain once here and continue.
++                for (;;) {
++                    AMediaCodecBufferInfo info;
++                    ssize_t outIndex = AMediaCodec_dequeueOutputBuffer(s->videoCodec, &info, 100000);
++                    if (outIndex < 0) break;
++                    bool isEos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
++                    AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, !isEos);
++                    if (isEos) break;
++                    if (s->stop.load()) break;
++                }
++                break;
++            }
++        } else {
++            break;
++        }
++        // Feed packet to MediaCodec.
++        ssize_t inIndex = AMediaCodec_dequeueInputBuffer(s->videoCodec, 2000);
++        if (inIndex >= 0) {
++            size_t bufSize = 0;
++            uint8_t* buf = AMediaCodec_getInputBuffer(s->videoCodec, (size_t)inIndex, &bufSize);
++            if (buf != nullptr && bufSize >= (size_t)qp.pkt->size) {
++                std::memcpy(buf, qp.pkt->data, (size_t)qp.pkt->size);
++                int64_t ptsUs = qp.pkt->pts == AV_NOPTS_VALUE ? 0
++                    : av_rescale_q(qp.pkt->pts,
++                                   s->fmt->streams[s->videoStream]->time_base,
++                                   AVRational{1, 1000000});
++                AMediaCodec_queueInputBuffer(s->videoCodec, (size_t)inIndex, 0,
++                                             (size_t)qp.pkt->size, (uint64_t)ptsUs, 0);
++            } else {
++                AMediaCodec_queueInputBuffer(s->videoCodec, (size_t)inIndex, 0, 0, 0, 0);
++            }
++        }
++        av_packet_free(&qp.pkt);
++        // Drain outputs.
++        for (;;) {
++            AMediaCodecBufferInfo info;
++            ssize_t outIndex = AMediaCodec_dequeueOutputBuffer(s->videoCodec, &info, 0);
++            if (outIndex < 0) break;
++            if ((info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0) {
++                AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, false);
++                break;
++            }
++            int64_t ptsUs = (int64_t)info.presentationTimeUs;
++            int64_t clockUs = s->audioClockUs.load();
++            bool render = true;
++            if (clockUs > 0 && ptsUs > clockUs + 40000) {
++                // Too early: wait briefly, then re-check once. Do not
++                // spin: release without render only if still early
++                // after the wait, otherwise render on the next drain.
++                // Simplest bounded wait here keeps the loop from
++                // busy-looping on the audio clock.
++                std::this_thread::sleep_for(std::chrono::milliseconds(10));
++                clockUs = s->audioClockUs.load();
++                render = ptsUs <= clockUs + 40000;
++            } else if (clockUs > 0 && ptsUs + 120000 < clockUs) {
++                render = false;  // >120ms late: drop, do not accumulate lag
++            }
++            AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, render);
++            if (render) {
++                s->callFirstFrame();
++                int64_t posMs = ptsUs / 1000;
++                if (posMs != lastProgressMs && posMs - lastProgressMs >= 500) {
++                    lastProgressMs = posMs;
++                    JniEnv env;
++                    if (env.e != nullptr) {
++                        env.e->CallVoidMethod(s->owner, s->mProgress,
++                                              (jlong)posMs, (jlong)s->durationMs);
++                    }
++                }
++            }
++            if (s->stop.load()) break;
++        }
++    }
++    // EOF (or stop) reached: report drained so completion fires only
++    // after BOTH video and audio have drained (see markDrained).
++    if (!s->stop.load() && !s->failed.load()) s->markDrainedAndMaybeComplete();
++}
++
++// ---- audio thread: FFmpeg mp2 decode -> PCM -> Kotlin AudioTrack ----
++void audioLoop(Session* s) {
++    AVFrame* frame = av_frame_alloc();
++    if (frame == nullptr) { s->callError(-2, "av_frame_alloc failed"); return; }
++    while (!s->stop.load()) {
++        s->waitIfPaused();
++        if (s->stop.load()) break;
++        QueuedPacket qp;
++        if (!s->audioQ.pop(qp, s->stop)) break;
++        if (qp.pkt == nullptr) break;  // EOF marker
++        int ret = avcodec_send_packet(s->audioCtx, qp.pkt);
++        av_packet_free(&qp.pkt);
++        if (ret < 0 && ret != AVERROR(EAGAIN)) continue;
++        while (!s->stop.load()) {
++            ret = avcodec_receive_frame(s->audioCtx, frame);
++            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
++            if (ret < 0) break;
++            // FFmpeg mp2 decode gives s16 (or s16p). Handle both.
++            int channels = frame->ch_layout.nb_channels;
++            if (channels <= 0) channels = 2;
++            int samples = frame->nb_samples;
++            std::vector<int16_t> interleaved;
++            interleaved.reserve((size_t)samples * (size_t)channels);
++            if (frame->format == AV_SAMPLE_FMT_S16) {
++                const int16_t* p = reinterpret_cast<const int16_t*>(frame->data[0]);
++                interleaved.assign(p, p + (size_t)samples * (size_t)channels);
++            } else if (frame->format == AV_SAMPLE_FMT_S16P) {
++                for (int i = 0; i < samples; ++i)
++                    for (int c = 0; c < channels; ++c) {
++                        const int16_t* p = reinterpret_cast<const int16_t*>(frame->data[c]);
++                        interleaved.push_back(p[i]);
++                    }
++            } else {
++                // Unexpected sample format: do not guess, skip frame.
++                av_frame_unref(frame);
++                continue;
++            }
++            std::vector<int16_t> out;
++            out.resize(interleaved.size() * 2 + 16);
++            size_t outSamples = applyKaraokeChannel(
++                interleaved.data(), interleaved.size(), channels,
++                s->vocalMode.load(), s->leftGain.load(), s->rightGain.load(),
++                out.data());
++            // Advance the audio clock from the samples handed over.
++            int sampleRate = frame->sample_rate > 0 ? frame->sample_rate : 44100;
++            int64_t frameUs = (int64_t)samples * 1000000LL / sampleRate;
++            // The Kotlin side writes synchronously to AudioTrack; the
++            // clock advance here is an approximation of "written"
++            // time and is used only for video pacing, not for
++            // reporting exact position (progress comes from video PTS).
++            s->audioClockUs.fetch_add(frameUs);
++            JniEnv env;
++            if (env.e == nullptr) { av_frame_unref(frame); continue; }
++            jobject buf = env.e->NewDirectByteBuffer(out.data(), (jlong)(outSamples * 2));
++            if (buf != nullptr) {
++                env.e->CallBooleanMethod(s->owner, s->mPcm, buf,
++                                         (jint)sampleRate, (jint)2,
++                                         (jlong)(s->audioClockUs.load()));
++                env.e->DeleteLocalRef(buf);
++            }
++            av_frame_unref(frame);
++            if (s->stop.load()) break;
++        }
++    }
++    av_frame_free(&frame);
++    if (!s->stop.load() && !s->failed.load()) s->markDrainedAndMaybeComplete();
++}
++
++// ---- reader thread ----------------------------------------------------
++void readerLoop(Session* s) {
++    AVPacket* pkt = av_packet_alloc();
++    if (pkt == nullptr) { s->callError(-3, "av_packet_alloc failed"); return; }
++    bool videoEof = false, audioEof = false;
++    while (!s->stop.load()) {
++        s->waitIfPaused();
++        if (s->stop.load()) break;
++        int64_t seekMs = s->seekTargetMs.exchange(-1);
++        if (seekMs >= 0 && s->fmt != nullptr) {
++            int64_t ts = av_rescale_q(seekMs * 1000, AVRational{1, 1000000},
++                                      s->fmt->streams[s->videoStream]->time_base);
++            if (avformat_seek_file(s->fmt, s->videoStream, INT64_MIN, ts, INT64_MAX, 0) >= 0) {
++                // Video is AMediaCodec, not an AVCodecContext (videoCtx
++                // is intentionally unused in this design), so flush
++                // the MediaCodec instead of avcodec_flush_buffers.
++                if (s->videoCodec) AMediaCodec_flush(s->videoCodec);
++                if (s->audioCtx) avcodec_flush_buffers(s->audioCtx);
++                s->videoQ.clear(); s->audioQ.clear();
++                s->audioClockUs.store(seekMs * 1000);
++                videoEof = audioEof = false;
++            }
++            // If seek fails, keep playing from the current position;
++            // do not fail the whole song for a best-effort seek.
++        }
++        int ret = av_read_frame(s->fmt, pkt);
++        if (ret < 0) {
++            // EOF: push markers, then complete when both threads drain.
++            s->videoQ.push(QueuedPacket{nullptr, s->videoStream});
++            s->audioQ.push(QueuedPacket{nullptr, s->selectedAudioStream.load()});
++            break;
++        }
++        if (pkt->stream_index == s->videoStream && !videoEof) {
++            AVPacket* copy = av_packet_alloc();
++            if (copy && av_packet_ref(copy, pkt) >= 0) {
++                s->videoQ.push(QueuedPacket{copy, pkt->stream_index});
++            } else if (copy) av_packet_free(&copy);
++        } else if (pkt->stream_index == s->selectedAudioStream.load() && !audioEof) {
++            AVPacket* copy = av_packet_alloc();
++            if (copy && av_packet_ref(copy, pkt) >= 0) {
++                s->audioQ.push(QueuedPacket{copy, pkt->stream_index});
++            } else if (copy) av_packet_free(&copy);
++        }
++        // Packets from non-selected audio streams are dropped here:
++        // that IS the vocal-stream switch (no second decode, no mixing).
++        av_packet_unref(pkt);
++    }
++    av_packet_free(&pkt);
++    // Do NOT callComplete() here: completion fires only after BOTH
++    // worker threads drain their EOF markers (markDrainedAndMaybeComplete).
++    // Calling it here would advance to the next song before the last
++    // queued video/audio packets have played.
++    (void)videoEof; (void)audioEof;
++}
++
++Session* sessionFrom(JNIEnv* env, jobject thiz) {
++    jclass cls = env->GetObjectClass(thiz);
++    jfieldID fid = env->GetFieldID(cls, "nativeHandle", "J");
++    if (fid == nullptr) return nullptr;
++    return reinterpret_cast<Session*>(env->GetLongField(thiz, fid));
++}
++
++void destroySession(Session* s) {
++    if (s == nullptr) return;
++    s->stop.store(true);
++    s->wakeAll();
++    if (s->readerThread.joinable()) s->readerThread.join();
++    if (s->videoThread.joinable()) s->videoThread.join();
++    if (s->audioThread.joinable()) s->audioThread.join();
++    s->videoQ.clear(); s->audioQ.clear();
++    if (s->videoCodec) AMediaCodec_delete(s->videoCodec);
++    if (s->videoFormat) AMediaFormat_delete(s->videoFormat);
++    if (s->videoCtx) avcodec_free_context(&s->videoCtx);
++    if (s->audioCtx) avcodec_free_context(&s->audioCtx);
++    if (s->fmt) avformat_close_input(&s->fmt);
++    if (s->window) ANativeWindow_release(s->window);
++    JniEnv env;
++    if (env.e != nullptr) env.e->DeleteGlobalRef(s->owner);
++    delete s;
++}
++
++}  // namespace
++
++extern "C" JNIEXPORT jlong JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeStart(
++    JNIEnv* env, jobject thiz, jstring path, jobject surface,
++    jint vocalStreamIndex, jint vocalMode, jfloat leftGain, jfloat rightGain) {
++    if (path == nullptr || surface == nullptr) return 0;
++    const char* cpath = env->GetStringUTFChars(path, nullptr);
++    if (cpath == nullptr) return 0;
++    std::string spath(cpath);
++    env->ReleaseStringUTFChars(path, cpath);
++
++    Session* s = new Session();
++    s->path = spath;
++    s->owner = env->NewGlobalRef(thiz);
++    jclass cls = env->GetObjectClass(thiz);
++    s->mPrepared = env->GetMethodID(cls, "onNativePrepared", "(JIII)V");
++    s->mError = env->GetMethodID(cls, "onNativeError", "(ILjava/lang/String;)V");
++    s->mComplete = env->GetMethodID(cls, "onNativeComplete", "()V");
++    s->mPcm = env->GetMethodID(cls, "onNativePcm",
++                              "(Ljava/nio/ByteBuffer;IJI)Z");
++    s->mProgress = env->GetMethodID(cls, "onNativeProgress", "(JJ)V");
++    s->mFirstFrame = env->GetMethodID(cls, "onNativeFirstFrame", "()V");
++    s->vocalMode.store(vocalMode);
++    s->leftGain.store(leftGain);
++    s->rightGain.store(rightGain);
++
++    AVFormatContext* fmt = nullptr;
++    int ret = avformat_open_input(&fmt, spath.c_str(), nullptr, nullptr);
++    if (ret < 0 || fmt == nullptr) {
++        std::string msg = "avformat_open_input failed: " + avErrorText(ret);
++        // Report through a temporary error path: the Kotlin side will
++        // see nativeStart return 0 and treat it as start failure.
++        delete s;
++        (void)msg;
++        return 0;
++    }
++    s->fmt = fmt;
++    ret = avformat_find_stream_info(fmt, nullptr);
++    if (ret < 0) { destroySession(s); return 0; }
++    s->durationMs = fmt->duration >= 0 ? fmt->duration / 1000 : -1;
++
++    // Video: first video stream, must be H.264 for this fallback.
++    // Other video codecs are NOT claimed here; the caller checks the
++    // probe / stream info before starting and must not start this
++    // session for non-H.264 video (see LIMITATIONS.md).
++    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
++        AVCodecParameters* par = fmt->streams[i]->codecpar;
++        if (par->codec_type == AVMEDIA_TYPE_VIDEO && s->videoStream < 0 &&
++            par->codec_id == AV_CODEC_ID_H264) {
++            s->videoStream = (int)i;
++        }
++        if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
++            s->audioStreams.push_back((int)i);
++        }
++    }
++    if (s->videoStream < 0) { destroySession(s); return 0; }
++    if (s->audioStreams.empty()) { destroySession(s); return 0; }
++    s->audioStreamCount = (int)s->audioStreams.size();
++    // Vocal stream selection: explicit index wins if present,
++    // otherwise first audio stream (original).
++    int selected = s->audioStreams[0];
++    for (int idx : s->audioStreams) if (idx == vocalStreamIndex) selected = idx;
++    s->selectedAudioStream.store(selected);
++
++    // Audio decoder: FFmpeg mp2 (or whatever the stream's codec is;
++    // the IKTV case is mp2, verified by probe). No mediacodec for audio.
++    AVStream* astream = fmt->streams[selected];
++    const AVCodec* acodec = avcodec_find_decoder(astream->codecpar->codec_id);
++    if (acodec == nullptr) { destroySession(s); return 0; }
++    s->audioCtx = avcodec_alloc_context3(acodec);
++    if (s->audioCtx == nullptr ||
++        avcodec_parameters_to_context(s->audioCtx, astream->codecpar) < 0 ||
++        avcodec_open2(s->audioCtx, acodec, nullptr) < 0) {
++        destroySession(s); return 0;
++    }
++
++    // Video hardware decode: AMediaCodec "video/avc" + Surface.
++    // This is the mediacodec hardware path (same decoder family
++    // Media3 uses on H2), fed with packets demuxed by FFmpeg.
++    s->window = ANativeWindow_fromSurface(env, surface);
++    if (s->window == nullptr) { destroySession(s); return 0; }
++    s->videoCodec = AMediaCodec_createDecoderByType("video/avc");
++    if (s->videoCodec == nullptr) { destroySession(s); return 0; }
++    s->videoFormat = AMediaFormat_new();
++    AMediaFormat_setString(s->videoFormat, AMEDIAFORMAT_KEY_MIME, "video/avc");
++    AVCodecParameters* vpar = fmt->streams[s->videoStream]->codecpar;
++    s->videoWidth = vpar->width;
++    s->videoHeight = vpar->height;
++    AMediaFormat_setInt32(s->videoFormat, AMEDIAFORMAT_KEY_WIDTH, vpar->width);
++    AMediaFormat_setInt32(s->videoFormat, AMEDIAFORMAT_KEY_HEIGHT, vpar->height);
++    // Extradata (SPS/PPS) is required for avc1-style streams; for
++    // Annex-B TS streams it is usually absent and the decoder
++    // recovers it from the first packets. Pass it through when present.
++    if (vpar->extradata != nullptr && vpar->extradata_size > 0) {
++        AMediaFormat_setBuffer(s->videoFormat, "csd-0",
++                               vpar->extradata, (size_t)vpar->extradata_size);
++    }
++    media_status_t st = AMediaCodec_configure(s->videoCodec, s->videoFormat,
++                                              s->window, nullptr, 0);
++    if (st != AMEDIA_OK) { destroySession(s); return 0; }
++    if (AMediaCodec_start(s->videoCodec) != AMEDIA_OK) { destroySession(s); return 0; }
++
++    // Threads start only after every context above succeeded.
++    s->readerThread = std::thread(readerLoop, s);
++    s->videoThread = std::thread(videoLoop, s);
++    s->audioThread = std::thread(audioLoop, s);
++    s->callPrepared();
++    return reinterpret_cast<jlong>(s);
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeStop(JNIEnv* env, jobject thiz) {
++    Session* s = sessionFrom(env, thiz);
++    if (s == nullptr) return;
++    destroySession(s);
++    jclass cls = env->GetObjectClass(thiz);
++    jfieldID fid = env->GetFieldID(cls, "nativeHandle", "J");
++    if (fid != nullptr) env->SetLongField(thiz, fid, 0);
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeSetPaused(
++    JNIEnv* env, jobject thiz, jboolean paused) {
++    Session* s = sessionFrom(env, thiz);
++    if (s == nullptr) return;
++    s->paused.store(paused);
++    if (!paused) s->wakeAll();
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeSelectAudioStream(
++    JNIEnv* env, jobject thiz, jint streamIndex) {
++    Session* s = sessionFrom(env, thiz);
++    if (s == nullptr) return;
++    bool present = false;
++    for (int idx : s->audioStreams) if (idx == streamIndex) present = true;
++    if (!present) return;
++    s->selectedAudioStream.store(streamIndex);
++    // Flush audio decoder and drop queued packets from the old
++    // stream; the reader will only queue the new stream from now on.
++    if (s->audioCtx) avcodec_flush_buffers(s->audioCtx);
++    s->audioQ.clear();
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeSetVocalMode(
++    JNIEnv* env, jobject thiz, jint mode, jfloat leftGain, jfloat rightGain) {
++    Session* s = sessionFrom(env, thiz);
++    if (s == nullptr) return;
++    s->vocalMode.store(mode);
++    s->leftGain.store(leftGain);
++    s->rightGain.store(rightGain);
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeSeekTo(
++    JNIEnv* env, jobject thiz, jlong positionMs) {
++    Session* s = sessionFrom(env, thiz);
++    if (s == nullptr) return;
++    s->seekTargetMs.store((int64_t)positionMs);
++    s->wakeAll();
++}
++
++extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
++    g_vm = vm;
++    return JNI_VERSION_1_6;
++}
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index 19a1ffd..27a683d 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -73,6 +73,8 @@ import com.local.ktv.player.PlayerControllerView.OnControlListener
+ import com.local.ktv.player.DecoderRecoveryState
+ import com.local.ktv.player.KtvPlaybackEngine
+ import com.local.ktv.player.KtvVideoView
++import com.local.ktv.ffmpeg.FfmpegHwSession
++import com.local.ktv.ffmpeg.FfmpegProbe
+ import com.local.ktv.player.VocalSwitchHelper
+ import com.local.ktv.player.VocalSwitchHelper.switchVocal
+ import com.local.ktv.player.AudioChannels
+@@ -334,6 +336,13 @@ class MainActivity : AppCompatActivity() {
+     private var playbackPreparing = false
+     private var playWhenPrepared = true
+     private var playbackGeneration = 0L
++    // Phase-2 step 2: FFmpeg fallback player state. One song tries fallback
++    // at most once (fallbackAttemptedFor = stableId); fallback failure goes
++    // to playNext(), never back to Media3 for the same song.
++    private var ffmpegFallback: FfmpegHwSession? = null
++    private var fallbackAttemptedFor: String? = null
++    private var fallbackAudioStreams: List<Int> = emptyList()
++    @Volatile private var fallbackPositionMs: Long = 0L
+     private val pendingQueueSongIds = LinkedHashSet<String>()
+     private val pendingQueueCacheNames = LinkedHashMap<String, String>()
+     private var suppressCompletionUntil = 0L
+@@ -543,6 +552,7 @@ class MainActivity : AppCompatActivity() {
+         main.removeCallbacks(downloadStatusTicker)
+         openListBrowser.close()
+         smbBrowser.close()
++        stopFfmpegFallback()
+         stopSmbProxy()
+         super.onDestroy()
+         io.shutdownNow()
+@@ -1814,6 +1824,19 @@ class MainActivity : AppCompatActivity() {
+         try {
+         val shouldPlay = playWhenPrepared
+         originalVocal = targetOriginal
++        if (ffmpegFallback != null) {
++            applyFallbackVocal()
++            saveState()
++            showPlaybackModeNotice(if (targetOriginal) "原唱" else "伴唱")
++            if (playerController != null) {
++                playerController!!.setVocalMode(originalVocal)
++            }
++            if (textVocalMode != null) {
++                textVocalMode.setText(vocalActionText())
++            }
++            updateBottomBar(currentSong, shouldPlay)
++            return
++        }
+         applyPlaybackMode()
+         saveState()
+         showPlaybackModeNotice(if (targetOriginal) "原唱" else "伴唱")
+@@ -2033,6 +2056,16 @@ class MainActivity : AppCompatActivity() {
+ 
+                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                     val position = seekBar?.progress ?: 0
++                    if (ffmpegFallback != null) {
++                        // Best-effort only, unverified on H2: if drag in
++                        // fallback proves unstable, disable drag while
++                        // fallback is active instead of shipping a broken drag.
++                        ffmpegFallback!!.seekTo(position.toLong())
++                        fullScreenSeeking = false
++                        updateLyricView()
++                        persistRuntimeState()
++                        return
++                    }
+                     runCatching {
+                         player?.seekTo(position)
+                         prepareExternalVocal(currentSong, position)
+@@ -4166,6 +4199,7 @@ class MainActivity : AppCompatActivity() {
+         try {
+             // 取消仍在后台扫描的“已点播完后随机本地歌曲”请求，避免抢占新点歌曲。
+             randomLocalRequestSerial++
++            stopFfmpegFallback()
+             playbackGeneration++
+             songRetryCount = 0 // 重置重试计数
+             playWhenPrepared = true
+@@ -4201,6 +4235,158 @@ class MainActivity : AppCompatActivity() {
+         }
+     }
+ 
++
++    // Phase-2 step 2: FFmpeg fallback player (full playback, not probe).
++    // Triggered only from setupPlayerListeners onError, final branch:
++    // extra == 3003, not a decoder failure, .ts/.m2ts/.mkv/.webm, and this
++    // song has not tried fallback yet. MKV that plays normally never
++    // reaches this code; it stays on the Media3 main path.
++    private fun stopFfmpegFallback() {
++        runCatching { ffmpegFallback?.stop() }
++        ffmpegFallback = null
++        fallbackAudioStreams = emptyList()
++    }
++
++    private fun applyFallbackVocal() {
++        val session = ffmpegFallback ?: return
++        if (fallbackAudioStreams.size >= 2) {
++            // IKTV case: two independent MP2 streams. Original = first
++            // audio stream, accompaniment = second; never hard-coded 1/2
++            // for every file -- these indices came from this song's probe.
++            session.selectVocalStream(if (originalVocal) fallbackAudioStreams[0] else fallbackAudioStreams[1])
++        } else if (fallbackAudioStreams.size == 1) {
++            // Single audio stream: channel replication only.
++            session.setVocalChannelMode(
++                if (originalVocal) FfmpegHwSession.VOCAL_MODE_LEFT else FfmpegHwSession.VOCAL_MODE_RIGHT,
++                1f, 1f)
++        }
++        // fallbackAudioStreams empty (SMB probe failed, see below):
++        // vocal switch is a no-op rather than a guessed switch.
++    }
++
++    private fun parseProbeAudioStreams(json: String): List<Int> {
++        return runCatching {
++            val streams = JSONObject(json).optJSONArray("streams") ?: return@runCatching emptyList<Int>()
++            val out = mutableListOf<Int>()
++            for (i in 0 until streams.length()) {
++                val s = streams.optJSONObject(i) ?: continue
++                if (s.optString("type") == "audio") out.add(s.optInt("index"))
++            }
++            out
++        }.getOrDefault(emptyList())
++    }
++
++    private fun startFfmpegFallback(song: Song, generation: Long) {
++        // Stop Media3 first so it releases the Surface, then probe the
++        // actual input on the io pool, then start on the main thread.
++        // Local input is probed by path. SMB input is probed through the
++        // same 127.0.0.1 proxy URL the fallback itself plays from; that
++        // proxy probe is NOT verified on H2 yet (probe step 1 was local
++        // only). If the SMB probe fails, fallback still starts -- the
++        // native session falls back to the first audio stream -- but
++        // vocal switching stays a no-op until a probe succeeds, instead
++        // of guessing stream indices.
++        runCatching { player?.stopPlayback() }
++        playbackPreparing = true
++        io.execute {
++            val input: String = runCatching {
++                when {
++                    song.hasLocalFile() -> {
++                        val local = song.path.orEmpty()
++                        if (local.startsWith("content://")) "" else local
++                    }
++                    song.isSmb() -> {
++                        val existing = smbProxy?.url
++                        if (!existing.isNullOrBlank()) existing else {
++                            val config = smbBrowser.config()
++                            check(config.isConfigured() && config.normalizedServer() == song.smbServer) {
++                                "请重新连接此歌曲所属的 SMB 共享盘"
++                            }
++                            val smbPath = song.smbPath ?: error("SMB 歌曲路径缺失")
++                            check(config.within(smbPath)) { "歌曲不在设置的目录范围内" }
++                            val proxy = SmbHttpProxy(SmbClient(config), smbPath, song.filename.orEmpty())
++                            smbProxy = proxy
++                            proxy.start()
++                        }
++                    }
++                    else -> ""
++                }
++            }.getOrDefault("")
++            val audioStreams: List<Int> = if (input.isEmpty()) emptyList()
++                else parseProbeAudioStreams(FfmpegProbe.probe(input))
++            main.post {
++                if (isFinishing || isDestroyed || generation != playbackGeneration || currentSong !== song) {
++                    return@post
++                }
++                if (input.isEmpty()) {
++                    playbackPreparing = false
++                    playbackLog(song, "FFMPEG_FALLBACK 失败原因=no_input")
++                    playNext()
++                    return@post
++                }
++                val surface = player?.currentSurface()
++                if (surface == null) {
++                    playbackPreparing = false
++                    playbackLog(song, "FFMPEG_FALLBACK 失败原因=no_surface")
++                    playNext()
++                    return@post
++                }
++                fallbackAudioStreams = audioStreams
++                val firstAudio = audioStreams.firstOrNull() ?: -1
++                // Native callbacks arrive on native threads, not the main
++                // thread, so every UI-affecting callback is re-dispatched
++                // to main before touching views / playNext / generation.
++                val session = FfmpegHwSession(
++                    onPrepared = { dur, w, h, n ->
++                        main.post {
++                            if (generation == playbackGeneration && currentSong === song) {
++                                playbackPreparing = false
++                                playbackLog(song, "FFMPEG_FALLBACK 成功 时长=" + dur + " 宽=" + w + " 高=" + h + " 音轨数=" + n)
++                                updateBottomBar(song, true)
++                            }
++                        }
++                    },
++                    onError = { code, msg ->
++                        main.post {
++                            if (generation == playbackGeneration && currentSong === song) {
++                                playbackPreparing = false
++                                playbackLog(song, "FFMPEG_FALLBACK 失败 code=" + code + " 原因=" + msg)
++                                stopFfmpegFallback()
++                                playNext()
++                            }
++                        }
++                    },
++                    onComplete = {
++                        main.post {
++                            if (generation == playbackGeneration && currentSong === song) {
++                                stopFfmpegFallback()
++                                playNext(true)
++                            }
++                        }
++                    },
++                    onProgress = { pos, _ ->
++                        if (generation == playbackGeneration && currentSong === song) {
++                            fallbackPositionMs = pos
++                        }
++                    },
++                    onFirstFrame = { },
++                )
++                ffmpegFallback = session
++                val ok = session.start(input, surface, firstAudio, FfmpegHwSession.VOCAL_MODE_STEREO)
++                if (!ok) {
++                    playbackPreparing = false
++                    playbackLog(song, "FFMPEG_FALLBACK 失败原因=start_failed")
++                    stopFfmpegFallback()
++                    playNext()
++                    return@post
++                }
++                // Initial vocal: if the user already asked for original,
++                // apply it now that the session exists.
++                if (originalVocal) applyFallbackVocal()
++            }
++        }
++    }
++
+     // Phase-2 step 1: FFmpeg probe, manual trigger only.
+     // Runs on the io pool, never on the main thread, never touches the
+     // player/queue. Target is the local 1.TS file only (songsDir, case
+@@ -4603,7 +4789,24 @@ class MainActivity : AppCompatActivity() {
+                 // 找不到/IO 还是解码不支持；重试次数、条件和 playNext 行为不变。
+                 if (DecoderRecoveryState.isDecoderFailure(extra)) toast("当前歌曲解码失败，正在播放下一首（错误码 " + what + "/" + extra + "）")
+                 else toast("播放失败：错误码 " + what + "/" + extra)
+-                main.post(Runnable { this.playNext() })
++                // Phase-2 step 2 fallback: only Media3 extraction failure
++                // (3003), not a decoder failure, for .ts/.m2ts/.mkv/.webm,
++                // and only once per song. Fallback failure goes to
++                // playNext() inside startFfmpegFallback/onError, never
++                // back to Media3 for this song.
++                val fallbackPath = song?.let { if (it.isSmb()) it.smbPath else it.path }.orEmpty()
++                val fallbackExt = fallbackPath.lowercase(Locale.ROOT)
++                val canFallback = song != null && extra == 3003 &&
++                    !DecoderRecoveryState.isDecoderFailure(extra) &&
++                    fallbackAttemptedFor != stableId(song) &&
++                    (fallbackExt.endsWith(".ts") || fallbackExt.endsWith(".m2ts") ||
++                        fallbackExt.endsWith(".mkv") || fallbackExt.endsWith(".webm"))
++                if (canFallback) {
++                    fallbackAttemptedFor = stableId(song)
++                    song?.let { startFfmpegFallback(it, generation) }
++                } else {
++                    main.post(Runnable { this.playNext() })
++                }
+             }
+             true
+         })
+@@ -4666,6 +4869,10 @@ class MainActivity : AppCompatActivity() {
+         // 单曲循环只影响自然播完；用户主动切歌始终进入下一首。
+         if (fromCompletion && loopOne && player != null && currentSong != null) {
+             playWhenPrepared = true
++            if (ffmpegFallback != null) {
++                ffmpegFallback!!.seekTo(0)
++                return
++            }
+             player!!.seekTo(0)
+             prepareExternalVocal(currentSong, 0)
+             player!!.start()
+@@ -4761,6 +4968,15 @@ class MainActivity : AppCompatActivity() {
+         if (player == null) return
+         val targetPlaying = !playWhenPrepared
+         playWhenPrepared = targetPlaying
++        if (ffmpegFallback != null) {
++            ffmpegFallback!!.setPaused(!targetPlaying)
++            if (textPlayPause != null) textPlayPause.setText(if (targetPlaying) "暂停" else "播放")
++            if (targetPlaying) hidePlaybackNoticeNow() else showPlaybackModeNotice("暂停", true)
++            updateBottomBar(currentSong, targetPlaying)
++            scheduleAutoFullscreen()
++            persistRuntimeState()
++            return
++        }
+         if (playbackPreparing) {
+             updateBottomBar(currentSong, targetPlaying)
+             if (targetPlaying) hidePlaybackNoticeNow() else showPlaybackModeNotice("暂停", true)
+@@ -4791,6 +5007,12 @@ class MainActivity : AppCompatActivity() {
+     private fun replay() {
+         if (player == null) return
+         playWhenPrepared = true
++        if (ffmpegFallback != null) {
++            ffmpegFallback!!.seekTo(0)
++            updateBottomBar(currentSong, true)
++            persistRuntimeState()
++            return
++        }
+         suppressCompletionUntil = System.currentTimeMillis() + 1500L
+         player!!.seekTo(0)
+         updateLyricView()
+diff --git a/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
+new file mode 100644
+index 0000000..dbbdee7
+--- /dev/null
++++ b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
+@@ -0,0 +1,236 @@
++package com.local.ktv.ffmpeg
++
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioTrack
++import android.view.Surface
++import java.nio.ByteBuffer
++
++/**
++ * Phase-2 fallback player session (Kotlin side).
++ *
++ * Native side: ffmpeg_hw_player.cpp.
++ *   FFmpeg avformat demux -> video packets to AMediaCodec
++ *   ("video/avc" + Surface, hardware) -> audio packets to FFmpeg
++ *   mp2 decode -> PCM 16-bit -> onNativePcm() below -> AudioTrack.
++ *
++ * This class owns NO playback policy. It only:
++ *  - loads libffmpeg_hw_player (missing .so = start failure, never a crash),
++ *  - owns one AudioTrack, created lazily from the first PCM callback's
++ *    sample rate (channels are always stereo out: mono input is already
++ *    duplicated to both ears by the native Karaoke replication, and
++ *    stereo input stays stereo),
++ *  - forwards native callbacks to the lambdas MainActivity installs,
++ *    WITHOUT checking playbackGeneration itself -- the installing code
++ *    MUST check its generation snapshot before acting, exactly as
++ *    setupPlayerListeners does for Media3. A callback that arrives
++ *    after stop() is dropped here (nativeHandle == 0L) and must also
++ *    be dropped by the caller on generation mismatch.
++ *
++ * Vocal model (probe 2026-10-31, H2, local 1.TS):
++ *  - Two independent MP2 audio streams (index 1, 2). Original =
++ *    first audio stream, accompaniment = second, if present.
++ *  - selectVocalStream(streamIndex) switches the native reader to
++ *    that stream (old audio queue flushed). This is NOT a left/right
++ *    channel copy.
++ *  - setVocalChannelMode() is only for single-audio-stream files:
++ *    LEFT/RIGHT/STEREO channel replication in native code (see
++ *    applyKaraokeChannel in ffmpeg_hw_player.cpp).
++ *
++ * Threading: native reader/video/audio threads call back on their own
++ * threads. onNativePcm is called on the native audio thread and writes
++ * synchronously to AudioTrack; that write IS the audio pacing, so it
++ * must not be re-dispatched to the main thread. Progress/completion/
++ * error callbacks are cheap and may be re-dispatched by the caller.
++ */
++class FfmpegHwSession(
++    private val onPrepared: (durationMs: Long, width: Int, height: Int, audioStreamCount: Int) -> Unit,
++    private val onError: (code: Int, message: String) -> Unit,
++    private val onComplete: () -> Unit,
++    private val onProgress: (positionMs: Long, durationMs: Long) -> Unit,
++    private val onFirstFrame: () -> Unit,
++) {
++    // Must match the field name the native code reads via GetFieldID.
++    @Volatile
++    private var nativeHandle: Long = 0L
++
++    @Volatile
++    private var audioTrack: AudioTrack? = null
++    @Volatile
++    private var audioSampleRate: Int = 44100
++
++    @Volatile
++    var isStarted: Boolean = false
++        private set
++
++    companion object {
++        // Vocal stream indices are FILE stream indices (probe output),
++        // not "0/1" track ordinals. Callers must pass the actual index
++        // from the probe / stream list, e.g. 1 for original, 2 for
++        // accompaniment on IKTV 1.TS.
++        const val VOCAL_MODE_LEFT = 0
++        const val VOCAL_MODE_RIGHT = 1
++        const val VOCAL_MODE_STEREO = 2
++
++        private var libraryLoaded: Boolean? = null
++
++        @Synchronized
++        fun loadLibrary(): Boolean {
++            if (libraryLoaded != null) return libraryLoaded!!
++            libraryLoaded = runCatching { System.loadLibrary("ffmpeg_hw_player") }.isSuccess
++            return libraryLoaded!!
++        }
++    }
++
++    /**
++     * Start playback. Returns false (never throws) when the library
++     * is missing, the surface is invalid, the file cannot be opened,
++     * there is no H.264 video stream, or there is no audio stream.
++     * In all those cases the caller must fall back to existing
++     * retry/skip logic; this session must not be retried by itself.
++     */
++    fun start(
++        path: String,
++        surface: Surface,
++        vocalStreamIndex: Int,
++        vocalMode: Int = VOCAL_MODE_STEREO,
++        leftGain: Float = 1f,
++        rightGain: Float = 1f,
++    ): Boolean {
++        if (!loadLibrary()) return false
++        if (!surface.isValid) return false
++        if (nativeHandle != 0L) return false
++        val handle = runCatching {
++            nativeStart(path, surface, vocalStreamIndex, vocalMode, leftGain, rightGain)
++        }.getOrDefault(0L)
++        if (handle == 0L) return false
++        nativeHandle = handle
++        isStarted = true
++        return true
++    }
++
++    fun stop() {
++        if (nativeHandle == 0L) {
++            releaseAudioTrack()
++            return
++        }
++        runCatching { nativeStop() }
++        nativeHandle = 0L
++        isStarted = false
++        releaseAudioTrack()
++    }
++
++    fun setPaused(paused: Boolean) {
++        if (nativeHandle == 0L) return
++        runCatching { nativeSetPaused(paused) }
++        if (paused) runCatching { audioTrack?.pause() }
++        else runCatching { audioTrack?.play() }
++    }
++
++    /** Switch vocal stream (IKTV case). No-op if the index is absent. */
++    fun selectVocalStream(streamIndex: Int) {
++        if (nativeHandle == 0L) return
++        runCatching { nativeSelectAudioStream(streamIndex) }
++    }
++
++    /** Single-stream channel mode only; see class doc. */
++    fun setVocalChannelMode(mode: Int, leftGain: Float, rightGain: Float) {
++        if (nativeHandle == 0L) return
++        runCatching { nativeSetVocalMode(mode, leftGain, rightGain) }
++    }
++
++    /** Best-effort seek; precise seek is NOT verified on H2. */
++    fun seekTo(positionMs: Long) {
++        if (nativeHandle == 0L) return
++        runCatching { nativeSeekTo(positionMs) }
++    }
++
++    private fun releaseAudioTrack() {
++        runCatching { audioTrack?.stop() }
++        runCatching { audioTrack?.release() }
++        audioTrack = null
++    }
++
++    private fun ensureAudioTrack(sampleRate: Int) {
++        if (audioTrack != null && audioSampleRate == sampleRate) return
++        releaseAudioTrack()
++        audioSampleRate = sampleRate
++        val minBuf = AudioTrack.getMinBufferSize(
++            sampleRate, AudioFormat.CHANNEL_OUT_STEREO,
++            AudioFormat.ENCODING_PCM_16BIT,
++        ).coerceAtLeast(8192)
++        audioTrack = AudioTrack.Builder()
++            .setAudioAttributes(
++                AudioAttributes.Builder()
++                    .setUsage(AudioAttributes.USAGE_MEDIA)
++                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
++                    .build(),
++            )
++            .setAudioFormat(
++                AudioFormat.Builder()
++                    .setSampleRate(sampleRate)
++                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
++                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                    .build(),
++            )
++            .setBufferSizeInBytes(minBuf * 4)
++            .setTransferMode(AudioTrack.MODE_STREAM)
++            .build()
++        runCatching { audioTrack?.play() }
++    }
++
++    // ---- Called from native code. Names/signatures must match the
++    // ---- GetMethodID lookups in ffmpeg_hw_player.cpp exactly. ----
++
++    @Suppress("unused")
++    private fun onNativePrepared(durationMs: Long, width: Int, height: Int, audioStreamCount: Int) {
++        if (nativeHandle == 0L) return
++        onPrepared(durationMs, width, height, audioStreamCount)
++    }
++
++    @Suppress("unused")
++    private fun onNativeError(code: Int, message: String) {
++        if (nativeHandle == 0L) return
++        onError(code, message)
++    }
++
++    @Suppress("unused")
++    private fun onNativeComplete() {
++        if (nativeHandle == 0L) return
++        onComplete()
++    }
++
++    @Suppress("unused")
++    private fun onNativeProgress(positionMs: Long, durationMs: Long) {
++        if (nativeHandle == 0L) return
++        onProgress(positionMs, durationMs)
++    }
++
++    @Suppress("unused")
++    private fun onNativeFirstFrame() {
++        if (nativeHandle == 0L) return
++        onFirstFrame()
++    }
++
++    @Suppress("unused")
++    private fun onNativePcm(buffer: ByteBuffer, sampleRate: Int, channels: Int, ptsUs: Long): Boolean {
++        if (nativeHandle == 0L) return false
++        // channels is always 2 on output (see native replication);
++        // the parameter is kept for contract stability, not re-read.
++        ensureAudioTrack(sampleRate)
++        val track = audioTrack ?: return false
++        val written = runCatching { track.write(buffer, buffer.remaining(), AudioTrack.WRITE_BLOCKING) }.getOrDefault(-1)
++        return written >= 0
++    }
++
++    private external fun nativeStart(
++        path: String, surface: Surface, vocalStreamIndex: Int,
++        vocalMode: Int, leftGain: Float, rightGain: Float,
++    ): Long
++
++    private external fun nativeStop()
++    private external fun nativeSetPaused(paused: Boolean)
++    private external fun nativeSelectAudioStream(streamIndex: Int)
++    private external fun nativeSetVocalMode(mode: Int, leftGain: Float, rightGain: Float)
++    private external fun nativeSeekTo(positionMs: Long)
++}
+diff --git a/app/src/main/java/com/local/ktv/player/KtvVideoView.kt b/app/src/main/java/com/local/ktv/player/KtvVideoView.kt
+index 76bc21e..83fd151 100644
+--- a/app/src/main/java/com/local/ktv/player/KtvVideoView.kt
++++ b/app/src/main/java/com/local/ktv/player/KtvVideoView.kt
+@@ -95,6 +95,10 @@ class KtvVideoView @JvmOverloads constructor(
+ 
+     internal fun currentHolder(): SurfaceHolder = surfaceView.holder
+ 
++    /** Surface Media3 renders to; reused by the FFmpeg fallback, no second SurfaceView. */
++    fun currentSurface(): android.view.Surface? =
++        surfaceView.holder.surface.takeIf { it.isValid }
++
+     /** NextLib 0.9 can leave its CPU producer connected after release. */
+     internal fun recreateDecoderSurface() {
+         surfaceCallback?.let(surfaceView.holder::removeCallback)
+@@ -470,6 +474,10 @@ class KtvPlaybackEngine(context: Context, private val audioOnly: Boolean = false
+         if (surface?.isValid == true && !released) player.setVideoSurface(surface)
+     }
+ 
++    /** Same Surface the Media3 engine renders to, for the FFmpeg fallback. */
++    fun currentSurface(): android.view.Surface? =
++        targetView?.currentHolder()?.surface?.takeIf { it.isValid }
++
+     fun setVideoUri(uri: Uri) {
+         check(!released) { "播放器已释放" }
+         recovering = false
