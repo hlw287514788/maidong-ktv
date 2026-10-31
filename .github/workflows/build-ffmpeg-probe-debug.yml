@@ -130,10 +130,19 @@ jobs:
 
       - name: Install NDK 27.0.12077973 if not preinstalled
         if: env.NDK_NOT_PREINSTALLED == '1'
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: 27.0.12077973
-          link-to-sdk: true
+        run: |
+          # nttld/setup-ndk@v1 fails for this version with HTTP 404
+          # (probe #2): it tries a version-numbered URL, while Google
+          # distributes NDK r27 as android-ndk-r27-linux.zip.
+          # Download r27 directly and unpack it under the exact
+          # versioned path Gradle expects (27.0.12077973).
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+          unzip -q android-ndk-r27-linux.zip
+          mkdir -p "$ANDROID_HOME/ndk/27.0.12077973"
+          cp -a android-ndk-r27/. "$ANDROID_HOME/ndk/27.0.12077973/"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          ls "$ANDROID_HOME/ndk/27.0.12077973" | head -20
 
       - name: Check Android SDK (preinstalled on runner)
         run: |
