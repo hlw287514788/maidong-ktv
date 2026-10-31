@@ -1,0 +1,301 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index c93f398..c72006a 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -11,6 +11,13 @@ kotlin {
+ android {
+     namespace "com.local.ktv"
+     compileSdk 35
++    // Phase-2 step 1 (probe only): re-enable the upstream 2.1.4 native
++    // build for ONE module, ffmpeg_probe. No playback native code is
++    // restored; third_party/ffmpeg already ships in the upstream clone.
++    ndkVersion "27.0.12077973"
++    externalNativeBuild {
++        ndkBuild { path file("src/main/cpp/Android.mk") }
++    }
+     // v12: playback is back to Media3 ExoPlayer + nextlib FFmpeg audio
+     // extension (2.1.2 player stack). Video uses hardware MediaCodec,
+     // audio falls back to the FFmpeg extension where the system decoder
+@@ -20,6 +27,11 @@ android {
+     defaultConfig {
+         applicationId "com.local.ktv"
+         minSdk 21
++        externalNativeBuild {
++            ndkBuild {
++                arguments "NDK_APPLICATION_MK:=${file('src/main/cpp/Application.mk').absolutePath}"
++            }
++        }
+         targetSdk 25
+         versionCode 7
+         versionName "2.1.4"
+diff --git a/app/src/main/cpp/Android.mk b/app/src/main/cpp/Android.mk
+new file mode 100644
+index 0000000..c2c5f2c
+--- /dev/null
++++ b/app/src/main/cpp/Android.mk
+@@ -0,0 +1,33 @@
++# Phase-2 step 1: FFmpeg probe only (no playback, no rendering).
++# ndkBuild is used (not CMake) to match upstream 2.1.4's existing native
++# build system: app/build.gradle in the probe build enables ndkBuild with
++# this file, and third_party/ffmpeg is already present in the upstream
++# clone (arthenica ffmpeg-kit-full 6.0.LTS, see CI checklist) — no
++# binary is added by the text patch, and no .so is downloaded here.
++LOCAL_PATH := $(call my-dir)
++FFMPEG_ROOT := $(LOCAL_PATH)/../../../../third_party/ffmpeg
++
++include $(CLEAR_VARS)
++LOCAL_MODULE := avutil
++LOCAL_SRC_FILES := $(FFMPEG_ROOT)/lib/$(TARGET_ARCH_ABI)/libavutil.so
++include $(PREBUILT_SHARED_LIBRARY)
++
++include $(CLEAR_VARS)
++LOCAL_MODULE := avcodec
++LOCAL_SRC_FILES := $(FFMPEG_ROOT)/lib/$(TARGET_ARCH_ABI)/libavcodec.so
++include $(PREBUILT_SHARED_LIBRARY)
++
++include $(CLEAR_VARS)
++LOCAL_MODULE := avformat
++LOCAL_SRC_FILES := $(FFMPEG_ROOT)/lib/$(TARGET_ARCH_ABI)/libavformat.so
++include $(PREBUILT_SHARED_LIBRARY)
++
++include $(CLEAR_VARS)
++LOCAL_MODULE := ffmpeg_probe
++LOCAL_SRC_FILES := ffmpeg_probe.cpp
++LOCAL_C_INCLUDES := $(FFMPEG_ROOT)/include
++LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Werror=return-type -fexceptions
++LOCAL_LDFLAGS := -Wl,-z,max-page-size=16384
++LOCAL_SHARED_LIBRARIES := avformat avcodec avutil
++LOCAL_LDLIBS := -landroid -llog
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/app/src/main/cpp/Application.mk b/app/src/main/cpp/Application.mk
+new file mode 100644
+index 0000000..7b4e663
+--- /dev/null
++++ b/app/src/main/cpp/Application.mk
+@@ -0,0 +1,8 @@
++APP_PLATFORM := android-21
++APP_STL := c++_shared
++# Dual ABI on purpose: ship BOTH armeabi-v7a and arm64-v8a and let the
++# PackageManager pick the H2's primary ABI at install time. Do NOT pin
++# to one ABI — the H2's runtime ABI is settled by the probe itself
++# (Build.SUPPORTED_ABIS, logged with every probe run), not by guessing
++# from the MStar 838 Cortex-A53 (64-bit-capable) chip name.
++APP_ABI := armeabi-v7a arm64-v8a
+diff --git a/app/src/main/cpp/ffmpeg_probe.cpp b/app/src/main/cpp/ffmpeg_probe.cpp
+new file mode 100644
+index 0000000..fb466b1
+--- /dev/null
++++ b/app/src/main/cpp/ffmpeg_probe.cpp
+@@ -0,0 +1,120 @@
++// Phase-1 probe only: open a file with FFmpeg avformat and list its streams.
++// This file deliberately does NOT decode, render, or play anything.
++// It answers exactly one question for phase 2:
++//   "Can the Android FFmpeg build recognise this IKTV container, and is
++//    h264_mediacodec present for the hardware-decode step?"
++//
++// Expected result for an IKTV .ts (desktop VLC, 2026-10-31):
++//   format contains mpegts (or an equivalent TS identifier),
++//   video stream: h264, 720x480,
++//   audio stream: mp2 / mpga,
++//   h264_mediacodec: present.
++// If the on-device probe does not match, phase 2 must stop (see PLAN.md §9).
++
++#include <jni.h>
++
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++extern "C" {
++#include <libavformat/avformat.h>
++#include <libavcodec/avcodec.h>
++#include <libavutil/avutil.h>
++}
++
++namespace {
++
++std::string jsonEscape(const std::string& in) {
++    std::string out;
++    for (char c : in) {
++        if (c == '"' || c == '\\') {
++            out += '\\';
++            out += c;
++        } else if (static_cast<unsigned char>(c) < 0x20) {
++            char buf[8];
++            std::snprintf(buf, sizeof(buf), "\\u%04x", c);
++            out += buf;
++        } else {
++            out += c;
++        }
++    }
++    return out;
++}
++
++std::string probe(const char* path) {
++    AVFormatContext* format = nullptr;
++    int ret = avformat_open_input(&format, path, nullptr, nullptr);
++    if (ret < 0 || format == nullptr) {
++        char err[AV_ERROR_MAX_STRING_SIZE] = {0};
++        av_strerror(ret, err, sizeof(err));
++        return std::string("{\"ok\":false,\"error\":\"open_failed\",\"detail\":\"") +
++               jsonEscape(err) + "\"}";
++    }
++
++    ret = avformat_find_stream_info(format, nullptr);
++    if (ret < 0) {
++        char err[AV_ERROR_MAX_STRING_SIZE] = {0};
++        av_strerror(ret, err, sizeof(err));
++        avformat_close_input(&format);
++        return std::string("{\"ok\":false,\"error\":\"stream_info_failed\",\"detail\":\"") +
++               jsonEscape(err) + "\"}";
++    }
++
++    const bool mediacodecPresent =
++        avcodec_find_decoder_by_name("h264_mediacodec") != nullptr;
++
++    std::string out = "{\"ok\":true,\"format\":\"";
++    out += jsonEscape(format->iformat ? format->iformat->name : "");
++    out += "\",\"durationMs\":";
++    out += std::to_string(format->duration >= 0 ? format->duration / 1000 : -1);
++    out += ",\"h264_mediacodec\":";
++    out += mediacodecPresent ? "true" : "false";
++    out += ",\"streams\":[";
++
++    for (unsigned i = 0; i < format->nb_streams; ++i) {
++        const AVStream* stream = format->streams[i];
++        const AVCodecParameters* par = stream ? stream->codecpar : nullptr;
++        if (par == nullptr) continue;
++        if (i > 0) out += ",";
++        const char* type = "other";
++        if (par->codec_type == AVMEDIA_TYPE_VIDEO) type = "video";
++        if (par->codec_type == AVMEDIA_TYPE_AUDIO) type = "audio";
++        const char* codecName = avcodec_get_name(par->codec_id);
++        out += "{\"index\":";
++        out += std::to_string(i);
++        out += ",\"type\":\"";
++        out += type;
++        out += "\",\"codec\":\"";
++        out += jsonEscape(codecName ? codecName : "");
++        out += "\",\"width\":";
++        out += std::to_string(par->width);
++        out += ",\"height\":";
++        out += std::to_string(par->height);
++        out += ",\"sampleRate\":";
++        out += std::to_string(par->sample_rate);
++        out += ",\"channels\":";
++        out += std::to_string(par->ch_layout.nb_channels);
++        out += "}";
++    }
++    out += "]}";
++    avformat_close_input(&format);
++    return out;
++}
++
++}  // namespace
++
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_local_ktv_ffmpeg_FfmpegProbe_nativeProbe(JNIEnv* env, jclass /* clazz */,
++                                                  jstring path) {
++    if (path == nullptr) {
++        return env->NewStringUTF("{\"ok\":false,\"error\":\"null_path\"}");
++    }
++    const char* cpath = env->GetStringUTFChars(path, nullptr);
++    if (cpath == nullptr) {
++        return env->NewStringUTF("{\"ok\":false,\"error\":\"path_utf_failed\"}");
++    }
++    std::string result = probe(cpath);
++    env->ReleaseStringUTFChars(path, cpath);
++    return env->NewStringUTF(result.c_str());
++}
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index 2f4c9f2..19a1ffd 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -4201,6 +4201,42 @@ class MainActivity : AppCompatActivity() {
+         }
+     }
+ 
++    // Phase-2 step 1: FFmpeg probe, manual trigger only.
++    // Runs on the io pool, never on the main thread, never touches the
++    // player/queue. Target is the local 1.TS file only (songsDir, case
++    // insensitive); SMB/OpenList are NOT probed in this step. Any failure
++    // (file missing, .so missing, native error) is logged as
++    // FFMPEG_PROBE ... ok=false and toasted, never thrown, never a crash.
++    // Build.SUPPORTED_ABIS is logged with every run so the H2's real
++    // runtime ABI is settled by device evidence, not by guessing from
++    // the MStar chip name.
++    private fun runFfmpegProbeForLocalTs() {
++        io.execute {
++            runCatching {
++                val dir = AppPaths.songsDir
++                val target = dir.listFiles()?.firstOrNull {
++                    it.isFile && it.name.equals("1.ts", ignoreCase = true)
++                }
++                val abis = Build.SUPPORTED_ABIS?.joinToString(",").orEmpty()
++                if (target == null) {
++                    PlaybackDiagLog.append("FFMPEG_PROBE 歌曲=1.TS ABI=" + abis + " 结果={\"ok\":false,\"error\":\"file_missing\"}")
++                    main.post { toast("FFmpeg 探针：本地 1.TS 不存在，详见 playback.log") }
++                    return@runCatching
++                }
++                val result = com.local.ktv.ffmpeg.FfmpegProbe.probe(target.absolutePath)
++                    .replace("\n", " ").replace("\r", " ")
++                PlaybackDiagLog.append("FFMPEG_PROBE 歌曲=" + target.name + " ABI=" + abis + " 结果=" + result)
++                val ok = result.contains("\"ok\":true")
++                main.post { toast(if (ok) "FFmpeg 探针完成，详见 playback.log" else "FFmpeg 探针失败，详见 playback.log") }
++            }.onFailure {
++                runCatching {
++                    PlaybackDiagLog.append("FFMPEG_PROBE 歌曲=1.TS 结果={\"ok\":false,\"error\":\"probe_failed\"}")
++                }
++                main.post { toast("FFmpeg 探针失败，详见 playback.log") }
++            }
++        }
++    }
++
+     // 纯本地版播放报错日志：只在失败时记一行，歌名/歌手/来源/相对路径/
+     // 错误码/结果，不含 SMB 账号密码与 OpenList 令牌，本地只记文件名不记完整路径。
+     private fun playbackLog(song: Song?, detail: String) {
+@@ -7813,6 +7849,13 @@ class MainActivity : AppCompatActivity() {
+                 SettingsEntry(R.drawable.ott_ic_data_setting, "歌手头像", "本地头像文件夹优先，CDN 下载默认关闭", "设置") { showAvatarSettingsDialog() },
+                 SettingsEntry(R.drawable.ott_ic_data_upgrade, "重置曲库", "清除曲库索引与点播记录，本地文件保留", "重置") { confirmResetDatabase() },
+                 SettingsEntry(R.drawable.ott_ic_setting_storage_space, "硬盘读写权限") { toast(storageStatusText()) },
++                // Phase-2 step 1 (probe only): manual entry, never runs on
++                // startup/scan/play. Probes ONLY the local 1.TS file with
++                // FFmpeg avformat and writes the result to playback.log.
++                // Normal playback, MKV main path, queue and player are untouched.
++                SettingsEntry(R.drawable.ott_ic_data_setting, "FFmpeg 探针", "只探本地 1.TS，不播放", "开始探针") {
++                    runFfmpegProbeForLocalTs()
++                },
+             )
+             2 -> listOf(
+                 SettingsEntry(R.drawable.ott_ic_tv_display_mode, "自动全屏", "设置多久未操作后自动进入全屏", "设置间隔") { showAutoFullscreenDialog() },
+diff --git a/app/src/main/java/com/local/ktv/ffmpeg/FfmpegProbe.kt b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegProbe.kt
+new file mode 100644
+index 0000000..7ab73f5
+--- /dev/null
++++ b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegProbe.kt
+@@ -0,0 +1,25 @@
++package com.local.ktv.ffmpeg
++
++/**
++ * Phase-2 step 1: probe only, never plays/decodes/renders.
++ * Hardened vs the phase-1 skeleton: System.loadLibrary is NOT run in
++ * object init (that would crash the app on first access if the .so is
++ * missing); it runs inside probe()'s runCatching and any failure is
++ * returned as jni_failed JSON, never thrown to the caller.
++ * Callers must treat "ok":false as "probe unavailable", never as a
++ * playback failure. No password/token is ever passed to native code.
++ */
++object FfmpegProbe {
++    @Volatile private var libraryLoaded = false
++
++    /** Raw JSON from nativeProbe; never null, always contains "ok". */
++    external fun nativeProbe(path: String): String
++
++    fun probe(path: String): String = runCatching {
++        if (!libraryLoaded) {
++            System.loadLibrary("ffmpeg_probe")
++            libraryLoaded = true
++        }
++        nativeProbe(path)
++    }.getOrElse { "{\"ok\":false,\"error\":\"jni_failed\",\"detail\":\"${it.javaClass.simpleName}\"}" }
++}
