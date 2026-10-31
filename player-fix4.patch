@@ -1,0 +1,40 @@
+diff --git a/app/src/main/cpp/ffmpeg_hw_player.cpp b/app/src/main/cpp/ffmpeg_hw_player.cpp
+index bffae3a..78f5c1e 100644
+--- a/app/src/main/cpp/ffmpeg_hw_player.cpp
++++ b/app/src/main/cpp/ffmpeg_hw_player.cpp
+@@ -355,17 +355,29 @@ void videoLoop(Session* s) {
+             int64_t clockUs = s->audioClockUs.load();
+             bool render = true;
+             if (clockUs > 0 && ptsUs > clockUs + 40000) {
+-                // Too early: wait briefly, then re-check once. Do not
+-                // spin: release without render only if still early
+-                // after the wait, otherwise render on the next drain.
+-                // Simplest bounded wait here keeps the loop from
+-                // busy-looping on the audio clock.
+-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
++                // fix4: wait until this frame's time arrives instead of
++                // dropping it after a single 10ms wait. Video decodes
++                // far ahead of real-time audio, so the old one-shot
++                // wait dropped every frame (sound only, no picture).
++                // Sleep 10ms at a time, re-reading the audio clock;
++                // pause blocks on waitIfPaused instead of spinning,
++                // and stop exits the wait. Anti-stall cap: 5s per
++                // frame -- if the audio clock stalls, drop the frame
++                // and move on rather than hanging this thread forever.
++                int64_t waitedMs = 0;
++                while (!s->stop.load() && ptsUs > s->audioClockUs.load() + 40000
++                       && waitedMs < 5000) {
++                    if (s->paused.load()) s->waitIfPaused();
++                    if (s->stop.load()) break;
++                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++                    waitedMs += 10;
++                }
+                 clockUs = s->audioClockUs.load();
+                 render = ptsUs <= clockUs + 40000;
+             } else if (clockUs > 0 && ptsUs + 120000 < clockUs) {
+                 render = false;  // >120ms late: drop, do not accumulate lag
+             }
++            if (s->stop.load()) render = false;
+             AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, render);
+             if (render) {
+                 s->callFirstFrame();
