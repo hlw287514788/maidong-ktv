@@ -119,6 +119,13 @@ jobs:
           git -C upstream apply player-fix1.patch
           git -C upstream status --short
 
+      - name: Apply FFmpeg player fix2 patch (after fix1 patch, onNativePcm JNI signature IJI -> IIJ only)
+        run: |
+          cp player-fix2.patch upstream/
+          git -C upstream apply --check player-fix2.patch
+          git -C upstream apply player-fix2.patch
+          git -C upstream status --short
+
       - name: Remove igeba catalog databases (local-only, saves ~31 MB)
         run: |
           rm -f upstream/app/src/main/assets/igeba_catalog.db upstream/app/src/main/assets/singer_portraits.db
