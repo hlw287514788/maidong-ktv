@@ -1,0 +1,46 @@
+diff --git a/app/src/main/cpp/ffmpeg_hw_player.cpp b/app/src/main/cpp/ffmpeg_hw_player.cpp
+index 7ee94ff..bffae3a 100644
+--- a/app/src/main/cpp/ffmpeg_hw_player.cpp
++++ b/app/src/main/cpp/ffmpeg_hw_player.cpp
+@@ -430,14 +430,35 @@ void audioLoop(Session* s) {
+                 interleaved.data(), interleaved.size(), channels,
+                 s->vocalMode.load(), s->leftGain.load(), s->rightGain.load(),
+                 out.data());
+-            // Advance the audio clock from the samples handed over.
++            // fix3: anchor the audio clock to the audio frame's own PTS
++            // (scheme A), not to a duration sum starting at 0. TS video
++            // PTS is absolute (first frame ~1.4s), so a clock starting
++            // at 0 made every video frame look >40ms early and the
++            // video thread dropped them all: sound played, no picture.
++            // With the clock anchored to absolute audio PTS, video PTS
++            // and audio clock share the same scale. After a seek the
++            // reader stores a relative clock, but the next decoded
++            // frame re-anchors it to its absolute PTS (max() below),
++            // so seek does not permanently break alignment. When a
++            // frame has no valid PTS, fall back to duration advance.
+             int sampleRate = frame->sample_rate > 0 ? frame->sample_rate : 44100;
+             int64_t frameUs = (int64_t)samples * 1000000LL / sampleRate;
+-            // The Kotlin side writes synchronously to AudioTrack; the
+-            // clock advance here is an approximation of "written"
+-            // time and is used only for video pacing, not for
+-            // reporting exact position (progress comes from video PTS).
+-            s->audioClockUs.fetch_add(frameUs);
++            int64_t ptsUs = AV_NOPTS_VALUE;
++            if (frame->pts != AV_NOPTS_VALUE) {
++                AVStream* astream = s->fmt->streams[s->selectedAudioStream.load()];
++                ptsUs = av_rescale_q(frame->pts, astream->time_base,
++                                     AVRational{1, 1000000});
++            }
++            if (ptsUs != AV_NOPTS_VALUE) {
++                int64_t prev = s->audioClockUs.load();
++                s->audioClockUs.store(ptsUs > prev ? ptsUs : prev);
++            } else {
++                // The Kotlin side writes synchronously to AudioTrack; the
++                // clock advance here is an approximation of "written"
++                // time and is used only for video pacing, not for
++                // reporting exact position (progress comes from video PTS).
++                s->audioClockUs.fetch_add(frameUs);
++            }
+             JniEnv env;
+             if (env.e == nullptr) { av_frame_unref(frame); continue; }
+             jobject buf = env.e->NewDirectByteBuffer(out.data(), (jlong)(outSamples * 2));
