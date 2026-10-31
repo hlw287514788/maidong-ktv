@@ -112,6 +112,13 @@ jobs:
           git -C upstream apply player-diag.patch
           git -C upstream status --short
 
+      - name: Apply FFmpeg player fix1 patch (after diag patch, prepared-callback fix + start-return log only)
+        run: |
+          cp player-fix1.patch upstream/
+          git -C upstream apply --check player-fix1.patch
+          git -C upstream apply player-fix1.patch
+          git -C upstream status --short
+
       - name: Remove igeba catalog databases (local-only, saves ~31 MB)
         run: |
           rm -f upstream/app/src/main/assets/igeba_catalog.db upstream/app/src/main/assets/singer_portraits.db
