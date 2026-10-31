@@ -1,0 +1,178 @@
+diff --git a/app/src/main/cpp/ffmpeg_hw_player.cpp b/app/src/main/cpp/ffmpeg_hw_player.cpp
+index 78f5c1e..e78abad 100644
+--- a/app/src/main/cpp/ffmpeg_hw_player.cpp
++++ b/app/src/main/cpp/ffmpeg_hw_player.cpp
+@@ -208,7 +208,12 @@ struct PacketQueue {
+ struct Session {
+     jobject owner = nullptr;  // global ref to FfmpegHwSession
+     jmethodID mPrepared = nullptr, mError = nullptr, mComplete = nullptr,
+-              mPcm = nullptr, mProgress = nullptr, mFirstFrame = nullptr;
++              mPcm = nullptr, mProgress = nullptr, mFirstFrame = nullptr,
++              mVideoStats = nullptr;
++    // diag3: video-thread counters only, never used for playback decisions.
++    std::atomic<int64_t> videoFed{0}, videoInputTimeoutDropped{0},
++        videoTooSmallDropped{0}, videoOutput{0}, videoRendered{0},
++        videoEarlyTimeoutDropped{0}, videoLateDropped{0}, videoEosOutput{0};
+ 
+     std::string path;
+     ANativeWindow* window = nullptr;
+@@ -276,6 +281,21 @@ struct Session {
+         if (env.e == nullptr) return;
+         env.e->CallVoidMethod(owner, mFirstFrame);
+     }
++    // diag3: report video counters once, when the video thread ends
++    // (EOF drain or stop). Called before markDrainedAndMaybeComplete.
++    void callVideoStats() {
++        JniEnv env;
++        if (env.e == nullptr || mVideoStats == nullptr) return;
++        env.e->CallVoidMethod(owner, mVideoStats,
++                              (jlong)videoFed.load(),
++                              (jlong)videoInputTimeoutDropped.load(),
++                              (jlong)videoTooSmallDropped.load(),
++                              (jlong)videoOutput.load(),
++                              (jlong)videoRendered.load(),
++                              (jlong)videoEarlyTimeoutDropped.load(),
++                              (jlong)videoLateDropped.load(),
++                              (jlong)videoEosOutput.load());
++    }
+     void callPrepared() {
+         JniEnv env;
+         if (env.e == nullptr) return;
+@@ -315,6 +335,8 @@ void videoLoop(Session* s) {
+                     ssize_t outIndex = AMediaCodec_dequeueOutputBuffer(s->videoCodec, &info, 100000);
+                     if (outIndex < 0) break;
+                     bool isEos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
++                    if (isEos) s->videoEosOutput.fetch_add(1);
++                    else { s->videoOutput.fetch_add(1); s->videoRendered.fetch_add(1); }
+                     AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, !isEos);
+                     if (isEos) break;
+                     if (s->stop.load()) break;
+@@ -325,10 +347,16 @@ void videoLoop(Session* s) {
+             break;
+         }
+         // Feed packet to MediaCodec.
++        // diag3: counting only -- the 2ms timeout drop behaviour is unchanged.
+         ssize_t inIndex = AMediaCodec_dequeueInputBuffer(s->videoCodec, 2000);
+-        if (inIndex >= 0) {
++        if (inIndex < 0) {
++            s->videoInputTimeoutDropped.fetch_add(1);
++        } else if (inIndex >= 0) {
+             size_t bufSize = 0;
+             uint8_t* buf = AMediaCodec_getInputBuffer(s->videoCodec, (size_t)inIndex, &bufSize);
++            if (buf == nullptr || bufSize < (size_t)qp.pkt->size) {
++                s->videoTooSmallDropped.fetch_add(1);
++            }
+             if (buf != nullptr && bufSize >= (size_t)qp.pkt->size) {
+                 std::memcpy(buf, qp.pkt->data, (size_t)qp.pkt->size);
+                 int64_t ptsUs = qp.pkt->pts == AV_NOPTS_VALUE ? 0
+@@ -337,6 +365,7 @@ void videoLoop(Session* s) {
+                                    AVRational{1, 1000000});
+                 AMediaCodec_queueInputBuffer(s->videoCodec, (size_t)inIndex, 0,
+                                              (size_t)qp.pkt->size, (uint64_t)ptsUs, 0);
++                s->videoFed.fetch_add(1);
+             } else {
+                 AMediaCodec_queueInputBuffer(s->videoCodec, (size_t)inIndex, 0, 0, 0, 0);
+             }
+@@ -348,12 +377,15 @@ void videoLoop(Session* s) {
+             ssize_t outIndex = AMediaCodec_dequeueOutputBuffer(s->videoCodec, &info, 0);
+             if (outIndex < 0) break;
+             if ((info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0) {
++                s->videoEosOutput.fetch_add(1);
+                 AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, false);
+                 break;
+             }
++            s->videoOutput.fetch_add(1);
+             int64_t ptsUs = (int64_t)info.presentationTimeUs;
+             int64_t clockUs = s->audioClockUs.load();
+             bool render = true;
++            bool earlyTimeoutDrop = false;
+             if (clockUs > 0 && ptsUs > clockUs + 40000) {
+                 // fix4: wait until this frame's time arrives instead of
+                 // dropping it after a single 10ms wait. Video decodes
+@@ -374,11 +406,20 @@ void videoLoop(Session* s) {
+                 }
+                 clockUs = s->audioClockUs.load();
+                 render = ptsUs <= clockUs + 40000;
++                // diag3: waited the full 5s anti-stall cap and still early.
++                earlyTimeoutDrop = waitedMs >= 5000 && !render;
+             } else if (clockUs > 0 && ptsUs + 120000 < clockUs) {
+                 render = false;  // >120ms late: drop, do not accumulate lag
+             }
+             if (s->stop.load()) render = false;
+             AMediaCodec_releaseOutputBuffer(s->videoCodec, (size_t)outIndex, render);
++            if (render) {
++                s->videoRendered.fetch_add(1);
++            } else if (!s->stop.load() && earlyTimeoutDrop) {
++                s->videoEarlyTimeoutDropped.fetch_add(1);
++            } else if (!s->stop.load() && clockUs > 0 && ptsUs + 120000 < clockUs) {
++                s->videoLateDropped.fetch_add(1);
++            }
+             if (render) {
+                 s->callFirstFrame();
+                 int64_t posMs = ptsUs / 1000;
+@@ -394,6 +435,8 @@ void videoLoop(Session* s) {
+             if (s->stop.load()) break;
+         }
+     }
++    // diag3: report video counters once at video-thread end.
++    s->callVideoStats();
+     // EOF (or stop) reached: report drained so completion fires only
+     // after BOTH video and audio have drained (see markDrained).
+     if (!s->stop.load() && !s->failed.load()) s->markDrainedAndMaybeComplete();
+@@ -596,6 +639,8 @@ Java_com_local_ktv_ffmpeg_FfmpegHwSession_nativeStart(
+                               "(Ljava/nio/ByteBuffer;IIJ)Z");
+     s->mProgress = env->GetMethodID(cls, "onNativeProgress", "(JJ)V");
+     s->mFirstFrame = env->GetMethodID(cls, "onNativeFirstFrame", "()V");
++    // diag3: 8 longs, video-thread counters, reported once at thread end.
++    s->mVideoStats = env->GetMethodID(cls, "onNativeVideoStats", "(JJJJJJJJ)V");
+     s->vocalMode.store(vocalMode);
+     s->leftGain.store(leftGain);
+     s->rightGain.store(rightGain);
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index 41d56ef..c3043ac 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -4393,6 +4393,14 @@ class MainActivity : AppCompatActivity() {
+                             }
+                         }
+                     },
++                    // diag3: log-only, once per song at video-thread end.
++                    // No generation gate: the log names the captured song,
++                    // so a cut song's stats cannot be mistaken for the next.
++                    onVideoStats = { fed, inputTimeoutDropped, tooSmallDropped, output, rendered, earlyTimeoutDropped, lateDropped, _ ->
++                        main.post {
++                            playbackLog(song, "FFMPEG_FALLBACK 视频统计 喂包=" + fed + " 缓冲丢包=" + inputTimeoutDropped + " 缓冲太小丢包=" + tooSmallDropped + " 输出帧=" + output + " 渲染帧=" + rendered + " 早超时丢帧=" + earlyTimeoutDropped + " 晚丢帧=" + lateDropped)
++                        }
++                    },
+                 )
+                 ffmpegFallback = session
+                 // 诊断版：原生启动前记一行；若随后闪退且无此行，死在启动之前，
+diff --git a/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
+index 42f7571..01ec6f5 100644
+--- a/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
++++ b/app/src/main/java/com/local/ktv/ffmpeg/FfmpegHwSession.kt
+@@ -49,6 +49,8 @@ class FfmpegHwSession(
+     private val onComplete: () -> Unit,
+     private val onProgress: (positionMs: Long, durationMs: Long) -> Unit,
+     private val onFirstFrame: () -> Unit,
++    // diag3: video counters, reported once when the video thread ends.
++    private val onVideoStats: (fed: Long, inputTimeoutDropped: Long, tooSmallDropped: Long, output: Long, rendered: Long, earlyTimeoutDropped: Long, lateDropped: Long, eosOutput: Long) -> Unit = { _, _, _, _, _, _, _, _ -> },
+ ) {
+     // Must match the field name the native code reads via GetFieldID.
+     @Volatile
+@@ -217,6 +219,15 @@ class FfmpegHwSession(
+         onFirstFrame()
+     }
+ 
++    // diag3: no nativeHandle guard on purpose -- the video thread reports
++    // stats while nativeStop is joining it, and stop() clears the handle
++    // only after nativeStop returns, so no stale report can arrive after
++    // stop. The caller logs the captured song, not the current song.
++    @Suppress("unused")
++    private fun onNativeVideoStats(fed: Long, inputTimeoutDropped: Long, tooSmallDropped: Long, output: Long, rendered: Long, earlyTimeoutDropped: Long, lateDropped: Long, eosOutput: Long) {
++        onVideoStats(fed, inputTimeoutDropped, tooSmallDropped, output, rendered, earlyTimeoutDropped, lateDropped, eosOutput)
++    }
++
+     @Suppress("unused")
+     private fun onNativePcm(buffer: ByteBuffer, sampleRate: Int, channels: Int, ptsUs: Long): Boolean {
+         if (nativeHandle == 0L) return false
