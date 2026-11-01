@@ -1,0 +1,53 @@
+diff --git a/app/src/main/cpp/ffmpeg_hw_player.cpp b/app/src/main/cpp/ffmpeg_hw_player.cpp
+index e78abad..b769bd4 100644
+--- a/app/src/main/cpp/ffmpeg_hw_player.cpp
++++ b/app/src/main/cpp/ffmpeg_hw_player.cpp
+@@ -347,8 +347,46 @@ void videoLoop(Session* s) {
+             break;
+         }
+         // Feed packet to MediaCodec.
+-        // diag3: counting only -- the 2ms timeout drop behaviour is unchanged.
+-        ssize_t inIndex = AMediaCodec_dequeueInputBuffer(s->videoCodec, 2000);
++        // fix5: pace feeding to the audio clock. Feeding packets as
++        // fast as the demuxer produces them let the decoder run
++        // seconds ahead of real-time audio, fill its input/output
++        // buffers, and then drop most packets on the 2ms input
++        // timeout (diag3: 1561 dropped vs 663 fed) -- dropped
++        // reference frames show up as severe mosaic. Hold this
++        // packet until its PTS is near the audio clock instead.
++        // No PTS or a not-yet-started audio clock (0) means feed
++        // at once; the fix4 output wait still paces those frames.
++        int64_t pktPtsUs = AV_NOPTS_VALUE;
++        if (qp.pkt->pts != AV_NOPTS_VALUE) {
++            pktPtsUs = av_rescale_q(qp.pkt->pts,
++                                    s->fmt->streams[s->videoStream]->time_base,
++                                    AVRational{1, 1000000});
++        }
++        if (pktPtsUs != AV_NOPTS_VALUE) {
++            while (!s->stop.load()) {
++                int64_t clockUs = s->audioClockUs.load();
++                if (clockUs <= 0 || pktPtsUs <= clockUs + 100000) break;
++                if (s->paused.load()) s->waitIfPaused();
++                if (s->stop.load()) break;
++                std::this_thread::sleep_for(std::chrono::milliseconds(10));
++            }
++        }
++        if (s->stop.load()) {
++            av_packet_free(&qp.pkt);
++            break;
++        }
++        // fix5: do not drop a packet just because one 2ms input
++        // dequeue timed out while the decoder is busy. Retry every
++        // 5ms, up to 500ms of retries, then drop (and count it, as
++        // diag3 already does) only if still unavailable.
++        ssize_t inIndex = -1;
++        int64_t waitedInputMs = 0;
++        while (!s->stop.load()) {
++            inIndex = AMediaCodec_dequeueInputBuffer(s->videoCodec, 2000);
++            if (inIndex >= 0 || waitedInputMs >= 500) break;
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++            waitedInputMs += 5;
++        }
+         if (inIndex < 0) {
+             s->videoInputTimeoutDropped.fetch_add(1);
+         } else if (inIndex >= 0) {

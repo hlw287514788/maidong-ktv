@@ -1,0 +1,38 @@
+diff --git a/app/src/main/java/com/local/ktv/MainActivity.kt b/app/src/main/java/com/local/ktv/MainActivity.kt
+index c3043ac..b2fc4a0 100644
+--- a/app/src/main/java/com/local/ktv/MainActivity.kt
++++ b/app/src/main/java/com/local/ktv/MainActivity.kt
+@@ -1826,6 +1826,18 @@ class MainActivity : AppCompatActivity() {
+         originalVocal = targetOriginal
+         if (ffmpegFallback != null) {
+             applyFallbackVocal()
++            // diag4: log-only -- vocal switch + position 2s later, to
++            // tell whether the audio thread died or stalled on switch.
++            val diagSong = currentSong
++            val diagStream = if (fallbackAudioStreams.size >= 2) {
++                if (targetOriginal) fallbackAudioStreams[0] else fallbackAudioStreams[1]
++            } else {
++                fallbackAudioStreams.firstOrNull() ?: -1
++            }
++            playbackLog(diagSong, "FFMPEG_FALLBACK 原伴切换 目标=" + (if (targetOriginal) "原唱" else "伴唱") + " 音轨=" + diagStream)
++            main.postDelayed({
++                playbackLog(diagSong, "FFMPEG_FALLBACK 原伴切换后2秒 位置=" + fallbackPositionMs)
++            }, 2000L)
+             saveState()
+             showPlaybackModeNotice(if (targetOriginal) "原唱" else "伴唱")
+             if (playerController != null) {
+@@ -5011,6 +5023,14 @@ class MainActivity : AppCompatActivity() {
+         playWhenPrepared = targetPlaying
+         if (ffmpegFallback != null) {
+             ffmpegFallback!!.setPaused(!targetPlaying)
++            // diag4: log-only -- pause/resume + position 2s later, to
++            // tell whether resume really woke the fallback threads.
++            val diagSong = currentSong
++            val diagTarget = if (targetPlaying) "播放" else "暂停"
++            playbackLog(diagSong, "FFMPEG_FALLBACK 暂停切换 目标=" + diagTarget)
++            main.postDelayed({
++                playbackLog(diagSong, "FFMPEG_FALLBACK 暂停切换后2秒 目标=" + diagTarget + " 位置=" + fallbackPositionMs)
++            }, 2000L)
+             if (textPlayPause != null) textPlayPause.setText(if (targetPlaying) "暂停" else "播放")
+             if (targetPlaying) hidePlaybackNoticeNow() else showPlaybackModeNotice("暂停", true)
+             updateBottomBar(currentSong, targetPlaying)
