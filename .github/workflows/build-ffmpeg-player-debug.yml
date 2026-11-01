@@ -152,6 +152,21 @@ jobs:
           cp player-diag3.patch upstream/
           git -C upstream apply --check player-diag3.patch
           git -C upstream apply player-diag3.patch
+          git -C upstream status --short
+
+      - name: Apply FFmpeg player fix5 patch (after diag3 patch, video feeding paced to audio clock + input-buffer retry only)
+        run: |
+          cp player-fix5.patch upstream/
+          git -C upstream apply --check player-fix5.patch
+          git -C upstream apply player-fix5.patch
+          git -C upstream status --short
+
+      - name: Apply FFmpeg player diag4 patch (after fix5 patch, vocal-switch / pause-resume logs only)
+        run: |
+          cp player-diag4.patch upstream/
+          git -C upstream apply --check player-diag4.patch
+          git -C upstream apply player-diag4.patch
+          git -C upstream status --short
       - name: Remove igeba catalog databases (local-only, saves ~31 MB)
         run: |
           rm -f upstream/app/src/main/assets/igeba_catalog.db upstream/app/src/main/assets/singer_portraits.db
