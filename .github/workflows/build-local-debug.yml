@@ -97,3 +97,6 @@ jobs:
           name: maidong-local-debug
           path: upstream/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          # Artifact retention: 7 days, so old builds auto-delete and
+          # storage does not accumulate (zero-cost rule, 2026-11-03).
+          retention-days: 7
