@@ -1,4 +1,5 @@
 .gradle/
+.kotlin/
 .idea/
 local.properties
 **/build/
@@ -12,11 +13,15 @@ app/release/
 captures/
 **/captures/
 *.xml.bak
-database_publish/muse.db
-database_publish/muse.db.reassembled
 gradle.properties
 
 
 # Temp files
-.tmp_muse.db
 tools/__pycache__/
+**/__history/
+*.jks
+
+# Downloaded decoder regression media
+app/src/debug/assets/decoder-samples/*.mkv
+third_party/ffmpeg/.downloads/
+app/.cxx/

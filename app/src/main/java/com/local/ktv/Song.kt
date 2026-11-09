@@ -20,8 +20,17 @@ class Song {
     @JvmField var originalPath: String? = null
     @JvmField var accompanyPath: String? = null
     @JvmField var lyricPath: String? = null
+    @JvmField var openListServer: String? = null
+    @JvmField var openListPath: String? = null
+    fun isOpenList(): Boolean = !openListServer.isNullOrBlank() && !openListPath.isNullOrBlank()
+
     @JvmField var remote = false
     @JvmField var playCount = 0
+
+    @JvmField var sourceSongNumber: String? = null
+    @JvmField var sourceVoiceChannel = 0
+    @JvmField var sourceVersion = ""
+    @JvmField var sourceDurationSeconds = 0
 
     @JvmField var dbId: String? = null
     @JvmField var pinyinFull: String? = null
@@ -37,6 +46,12 @@ class Song {
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
+        put("openListServer", openListServer)
+        put("openListPath", openListPath)
+        put("sourceSongNumber", sourceSongNumber)
+        put("sourceVoiceChannel", sourceVoiceChannel)
+        put("sourceVersion", sourceVersion)
+        put("sourceDurationSeconds", sourceDurationSeconds)
         put("title", title)
         put("singer", singer)
         put("category", category)
@@ -69,24 +84,20 @@ class Song {
 
     fun displayTitle(): String = "${title.orEmpty()}  -  ${singer.orEmpty()}"
 
-    fun hasLocalFile(): Boolean = path?.takeIf(String::isNotEmpty)?.let(::File)?.let { file ->
-        SongFileValidator.inspect(file, SongFileValidator.requiresTransportStream(file)).valid
+    fun hasLocalFile(): Boolean = path?.takeIf(String::isNotEmpty)?.let { value ->
+        runCatching { SongStorage.valid(SongStorage.fromPath(value)) }.getOrDefault(false)
     } == true
 
     fun getDownloadUrl(): String {
-        downloadUrl?.takeIf(String::isNotEmpty)?.let { return it }
-        SongApiClient.getSongDownloadUrl(filename?.substringBeforeLast('.') ?: id)?.takeIf(String::isNotEmpty)?.let {
-            downloadUrl = it
-            return it
-        }
-        return filename?.takeIf(String::isNotEmpty)
-            ?.let { "https://pub.cdn.cherryonline.cn/video/cloud-song/$it" }
-            .orEmpty()
+        if (isOpenList()) return ""
+        val number = sourceSongNumber ?: return ""
+        return runCatching { IgebaApiClient.address(number).url }.getOrDefault("")
     }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is Song) return false
+        if (isOpenList() || other.isOpenList()) return id != null && id == other.id
         if (id != null && id == other.id) return true
         if (filename != null && filename == other.filename) return true
         if (path != null && path == other.path) return true
@@ -102,6 +113,7 @@ class Song {
             val parsed = parseName(base)
             id = path
             this.path = path
+            filename = name
             title = parsed.first
             singer = parsed.second
             val context = "$path $base"
@@ -117,10 +129,18 @@ class Song {
         @JvmStatic
         fun remote(json: JSONObject): Song = Song().apply {
             id = json.optString("id", json.optString("url"))
-            title = json.optString("title", json.optString("name", "未命名歌曲"))
-            singer = json.optString("singer", "网络曲库")
+            sourceSongNumber = json.optNullableString("sourceSongNumber")
+                ?: json.optNullableString("SongNumber")
+                ?: id?.takeIf { it.startsWith("igeba:song:") }?.substringAfterLast(':')
+            sourceSongNumber?.let { id = IgebaCatalog.songId(it); dbId = id }
+            sourceVoiceChannel = json.optInt("sourceVoiceChannel", json.optInt("VoiceChannel", 0))
+            sourceVersion = json.optString("sourceVersion", json.optString("Version"))
+            sourceDurationSeconds = json.optInt("sourceDurationSeconds", json.optInt("Duration", 0))
+            filename = json.optNullableString("filename") ?: json.optNullableString("FileName")
+            title = json.optString("title", json.optString("SongName", json.optString("name", "未命名歌曲")))
+            singer = json.optString("singer", json.optString("SingerName", "网络曲库"))
             category = json.optString("category", "网络")
-            language = json.optString("language", "国语")
+            language = json.optString("language", json.optString("LanguageName", "国语"))
             pinyin = json.optString("pinyin", initials(title.orEmpty()))
             album = json.optString("album", "")
             playCount = json.optInt("playCount", 0)
@@ -135,6 +155,13 @@ class Song {
         @JvmStatic
         fun fromJson(json: JSONObject): Song = Song().apply {
             id = json.optString("id")
+            openListServer = json.optNullableString("openListServer")
+            openListPath = json.optNullableString("openListPath")
+            sourceSongNumber = json.optNullableString("sourceSongNumber")
+                ?: id?.takeIf { it.startsWith("igeba:song:") }?.substringAfterLast(':')
+            sourceVoiceChannel = json.optInt("sourceVoiceChannel", 0)
+            sourceVersion = json.optString("sourceVersion", "")
+            sourceDurationSeconds = json.optInt("sourceDurationSeconds", 0)
             title = json.optString("title", "未命名歌曲")
             singer = json.optString("singer", "未知歌手")
             category = json.optString("category", "其他")
@@ -186,19 +213,12 @@ class Song {
                 val first = clean.substring(0, index).trim()
                 val second = clean.substring(index + separator.length).trim()
                 if (first.isEmpty() || second.isEmpty()) continue
-                if (looksLikeSinger(first, second)) return second to first
-                if (looksLikeSinger(second, first)) return first to second
-                return if (first.length <= second.length) first to second else second to first
+                // 本地加歌约定：歌手-歌名，歌名中的后续连字符原样保留。
+                return second to first
             }
             return (clean.ifEmpty { "未命名歌曲" }) to "本地歌曲"
         }
 
-        private fun looksLikeSinger(singer: String, title: String): Boolean {
-            val value = singer.lowercase()
-            if (containsAny(value, "群星", "合唱", "乐队", "组合")) return true
-            if (containsAny(value, "mv", "伴奏", "karaoke")) return false
-            return singer.length <= 8 && title.length >= 2
-        }
 
         private fun inferLanguage(context: String): String {
             val text = context.lowercase()

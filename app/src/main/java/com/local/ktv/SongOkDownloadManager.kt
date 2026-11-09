@@ -1,24 +1,20 @@
 package com.local.ktv
 
-import android.util.Log
-import com.liulishuo.okdownload.DownloadTask as OkDownloadTask
-import com.liulishuo.okdownload.OkDownload
-import com.liulishuo.okdownload.core.breakpoint.BreakpointInfo
-import com.liulishuo.okdownload.core.cause.EndCause
-import com.liulishuo.okdownload.core.cause.ResumeFailedCause
-import com.liulishuo.okdownload.core.listener.DownloadListener2
+import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 
+/** 新实现：有界分段、长度验证、取消及断点续传；不使用 OkDownload 或 TS 解密。 */
 object SongOkDownloadManager {
-    private const val TAG = "SongDownload"
-    const val MIN_VALID_FILE_SIZE = SongFileValidator.MIN_VALID_FILE_SIZE
-    private const val MAX_RETRY_COUNT = 3
-    private const val STALL_TIMEOUT_MS = 25_000L
-
+    const val MIN_VALID_FILE_SIZE = 64L
+    private const val CHUNK = 2 * 1024 * 1024
     interface DownloadCallback {
         fun onDownloadStart(song: Song)
         fun onDownloadProgress(song: Song, progress: Int)
@@ -26,326 +22,528 @@ object SongOkDownloadManager {
         fun onDownloadComplete(song: Song, localPath: String)
         fun onDownloadFailed(song: Song, error: String)
     }
-
-    private val tasks = ConcurrentHashMap<String, OkDownloadTask>()
-    private val pending = ConcurrentHashMap.newKeySet<String>()
-    private val callbacks = ConcurrentHashMap<String, DownloadCallback>()
-    private val progress = ConcurrentHashMap<String, Int>()
-    private val totalLengths = ConcurrentHashMap<String, Long>()
-    private val forcedRetryReasons = ConcurrentHashMap<String, String>()
-    private val manuallyCanceled = ConcurrentHashMap.newKeySet<String>()
-    private val io = Executors.newFixedThreadPool(4)
-    private val watchdog = Executors.newSingleThreadScheduledExecutor()
-
-    @JvmStatic
-    fun getLocalFile(song: Song): File {
-        val fileName = song.filename?.takeIf(String::isNotEmpty) ?: "${song.id}.ts"
-        return File("${MuseDatabase.VIDEO_ROOT}/${MuseDatabase.CLOUD_SONG_DIR}", fileName)
+    private class Job(val filename: String, var destination: SongStorage.Choice = SongStorage.choice(),
+                      val source: OpenListConfig? = null, val cloud: OpenListConfig? = null,
+                      val copyExisting: Boolean = false) {
+        var staging: File? = null
+        val cancelled = AtomicBoolean(false)
+        val readersStopped = AtomicBoolean(false)
+        val connections = java.util.concurrent.CopyOnWriteArraySet<HttpURLConnection>()
+        val inFlight = hashMapOf<Long, Long>()
+        var headerNanos = 0L
+        var readNanos = 0L
+        var writeNanos = 0L
+        var callbackNanos = 0L
+        var requests = 0
+        var lastProgressTime = 0L
+        var lastProgressValue = -1
+        val createdAt = System.nanoTime()
+        val callbacks = CopyOnWriteArrayList<DownloadCallback>()
+        @Volatile var connection: HttpURLConnection? = null
+        @Volatile var transferred = 0L
+        @Volatile var startedAt = 0L
+        @Volatile var total = 0L
+        @Volatile var received = 0L
+        @Volatile var progress = 0
+    }
+    fun transferStatus(song: Song): Pair<Int, Long>? {
+        val job = jobs[key(song)]?.takeUnless { it.cancelled.get() } ?: return null
+        return synchronized(job) {
+        val elapsed = (System.nanoTime() - job.startedAt).coerceAtLeast(1L)
+        val speed = if (job.startedAt == 0L) 0L else (job.transferred * 1_000_000_000.0 / elapsed).toLong()
+        val percent = if (job.total > 0) ((job.received + job.inFlight.values.sum()) * 100 / job.total).toInt().coerceIn(0, 99) else job.progress
+        percent to speed
+        }
     }
 
-    @JvmStatic
-    fun isDownloaded(song: Song): Boolean {
-        val file = getLocalFile(song)
-        if (file.exists()) {
-            val inspection = SongFileValidator.inspect(file, SongFileValidator.requiresTransportStream(file))
-            if (!inspection.valid) {
-                Log.w(TAG, "Discarding invalid song file: ${file.absolutePath}, ${inspection.reason}")
-                SongFileValidator.forget(file)
-                file.delete()
-                song.path = null
-            }
-        }
-        val downloaded = file.exists()
-        if (downloaded) {
-            // Catalog rows may still contain their original cloud-songNNNN path.
-            // Once the unified app directory has a verified file, it is the only
-            // valid playback source regardless of the stale non-null catalog path.
-            song.path = file.absolutePath
-        }
-        return downloaded
-    }
+    private data class Block(val bytes: ByteArray, val end: Long, val total: Long)
+    private val jobs = ConcurrentHashMap<String, Job>()
+    private val locks = ConcurrentHashMap<String, Any>()
+    private val spaceBudget = DownloadSpaceBudget()
+    private val io = Executors.newFixedThreadPool(3)
+    private val rangeIo = Executors.newFixedThreadPool(6)
+    @Volatile private var resetting = false
+    @Volatile internal var reclaimCache: ((SongStorage.Choice, Long) -> Unit)? = null
+    @Volatile internal var orderSnapshot: (() -> List<String>)? = null
 
-    @JvmStatic
-    fun isDownloading(song: Song): Boolean {
-        val key = songKey(song)
-        return tasks.containsKey(key) || pending.contains(key)
-    }
-
-    @JvmStatic
-    fun download(song: Song, callback: DownloadCallback?) {
-        if (isDownloaded(song)) {
-            val localFile = getLocalFile(song)
-            Log.i(TAG, "Using verified local file: ${localFile.absolutePath}, ${localFile.length()} bytes")
-            callback?.onDownloadComplete(song, localFile.absolutePath)
-            return
-        }
-        val key = songKey(song)
-        if (tasks.containsKey(key) || !pending.add(key)) {
-            callback?.onDownloadStart(song)
-            return
-        }
-        io.execute {
-            try {
-                val url = buildDownloadUrl(song)
-                if (url.isEmpty()) {
-                    pending.remove(key)
-                    callback?.onDownloadFailed(song, "无法生成下载地址")
-                } else {
-                    startDownloadTask(song, url, callback, 0)
+    /** Cancel and drain writers before clearing local files; never delete USB files here. */
+    fun resetLocalCache(clear: () -> Unit) {
+        val active = synchronized(this) {
+            check(!resetting) { "曲库正在重置" }
+            resetting = true
+            jobs.toMap().also { snapshot ->
+                snapshot.values.forEach { job ->
+                    job.cancelled.set(true)
+                    job.connection?.disconnect()
+                    job.connections.forEach { it.disconnect() }
                 }
-            } catch (error: Throwable) {
-                pending.remove(key)
-                callback?.onDownloadFailed(song, error.message ?: "下载初始化失败")
             }
         }
-    }
-
-    @JvmStatic
-    fun cancelDownload(song: Song) {
-        val key = songKey(song)
-        pending.remove(key)
-        tasks.remove(key)?.let { task ->
-            manuallyCanceled.add(key)
-            task.cancel()
-            clearBrokenDownload(task, getLocalFile(song))
-        }
-        callbacks.remove(key)
-        progress.remove(key)
-        totalLengths.remove(key)
-    }
-
-    @JvmStatic
-    fun getDownloadProgress(song: Song): Int = progress[songKey(song)] ?: 0
-
-    private fun buildDownloadUrl(song: Song, forceRefresh: Boolean = false): String {
-        if (!forceRefresh) song.downloadUrl?.takeIf(String::isNotBlank)?.let { return it }
-        val musicNo = song.filename?.removeSuffix(".ts")?.removeSuffix(".ls") ?: song.id
-        return SongApiClient.getSongDownloadUrl(musicNo).orEmpty().also { url ->
-            if (url.isNotEmpty()) song.downloadUrl = url else Log.w(TAG, "Unable to get download URL: ${song.title}")
-        }
-    }
-
-    private fun startDownloadTask(song: Song, url: String, callback: DownloadCallback?, attempt: Int) {
-        val key = songKey(song)
-        val target = getLocalFile(song)
-        val partial = File(target.parentFile, "${target.name}.download")
-        target.parentFile?.mkdirs()
-        if (attempt > 0) partial.delete()
-        val task = OkDownloadTask.Builder(url, partial.parentFile!!)
-            .setFilename(partial.name)
-            .setPassIfAlreadyCompleted(false)
-            .setMinIntervalMillisCallbackProcess(250)
-            .build()
-        tasks[key] = task
-        pending.remove(key)
-        callback?.let { callbacks[key] = it }
-        progress[key] = 0
-        totalLengths[key] = 0
-        val downloaded = AtomicLong(0)
-        val lastActivityAt = AtomicLong(System.currentTimeMillis())
-        var httpResponseCode = 0
-
-        scheduleStallCheck(song, task, lastActivityAt, attempt)
-        task.enqueue(object : DownloadListener2() {
-            override fun taskStart(task: OkDownloadTask) {
-                lastActivityAt.set(System.currentTimeMillis())
-                callbacks[key]?.onDownloadStart(song)
-            }
-
-            override fun connectEnd(
-                task: OkDownloadTask,
-                blockCount: Int,
-                responseCode: Int,
-                responseHeaderFields: MutableMap<String, MutableList<String>>,
-            ) {
-                httpResponseCode = responseCode
-                lastActivityAt.set(System.currentTimeMillis())
-            }
-
-            override fun downloadFromBeginning(task: OkDownloadTask, info: BreakpointInfo, cause: ResumeFailedCause) {
-                totalLengths[key] = info.totalLength
-            }
-
-            override fun downloadFromBreakpoint(task: OkDownloadTask, info: BreakpointInfo) {
-                totalLengths[key] = info.totalLength
-                downloaded.set(info.totalOffset)
-            }
-
-            override fun fetchProgress(task: OkDownloadTask, blockIndex: Int, increaseBytes: Long) {
-                if (increaseBytes > 0) lastActivityAt.set(System.currentTimeMillis())
-                val total = totalLengths[key] ?: return
-                if (total <= 0) return
-                val value = (downloaded.addAndGet(increaseBytes) * 100 / total).toInt().coerceIn(0, 98)
-                progress[key] = value
-                callbacks[key]?.onDownloadProgress(song, value)
-            }
-
-            override fun taskEnd(task: OkDownloadTask, cause: EndCause, realCause: Exception?) {
-                tasks.remove(key, task)
-                totalLengths.remove(key)
-                val cb = callbacks.remove(key)
-                val forcedReason = forcedRetryReasons.remove(key)
-                if (manuallyCanceled.remove(key)) return
-                if (cause != EndCause.COMPLETED) {
-                    val retryable = forcedReason != null || cause != EndCause.CANCELED
-                    if (retryable && attempt < MAX_RETRY_COUNT) {
-                        clearBrokenDownload(task, target)
-                        val response = if (httpResponseCode > 0) " HTTP $httpResponseCode" else ""
-                        retry(song, cb, attempt + 1, forcedReason ?: "${cause.name}$response")
-                    } else {
-                        pending.remove(key)
-                        progress.remove(key)
-                        cb?.onDownloadFailed(song, cause.name + (realCause?.message?.let { ": $it" } ?: ""))
-                    }
-                    return
-                }
-                pending.add(key)
-                progress[key] = 99
-                cb?.onDownloadProgress(song, 99)
-                io.execute { finalizeDownload(song, task, target, partial, cb, attempt) }
-            }
-        })
-    }
-
-    private fun finalizeDownload(
-        song: Song,
-        task: OkDownloadTask,
-        target: File,
-        partial: File,
-        callback: DownloadCallback?,
-        attempt: Int,
-    ) {
-        val key = songKey(song)
         try {
-            var downloadedFile = task.file ?: partial
-            if (!downloadedFile.exists() || downloadedFile.length() < MIN_VALID_FILE_SIZE) {
-                val size = downloadedFile.takeIf(File::exists)?.length() ?: 0L
-                clearBrokenDownload(task, target)
-                retryOrFail(song, callback, attempt, "file too small: $size", "下载文件异常，已自动清理")
-                return
-            }
-            if (TsDecryptor.isEncrypted(downloadedFile)) {
-                val decrypted = File(downloadedFile.parentFile, "${downloadedFile.name}.decrypted")
-                decrypted.delete()
-                val decryptedOk = TsDecryptor.decryptFile(downloadedFile, decrypted)
-                val replaced = decryptedOk && downloadedFile.delete() && decrypted.renameTo(downloadedFile)
-                if (!replaced) {
-                    clearBrokenDownload(task, target)
-                    retryOrFail(song, callback, attempt, "decrypt failed", "歌曲解密失败，异常文件已删除")
-                    return
-                }
-                downloadedFile = task.file ?: partial
-            }
-            val inspection = SongFileValidator.inspect(
-                downloadedFile,
-                SongFileValidator.requiresTransportStream(target),
-            )
-            if (!inspection.valid) {
-                Log.w(TAG, "Rejecting downloaded media for ${song.title}: ${inspection.reason}")
-                SongFileValidator.forget(downloadedFile)
-                clearBrokenDownload(task, target)
-                pending.remove(key)
-                progress.remove(key)
-                val message = inspection.durationMs?.let { duration ->
-                    "服务器返回试听片段（${duration / 1000}秒），未保存也未加入已点"
-                } ?: "下载文件不是有效歌曲视频，未保存也未加入已点"
-                callback?.onDownloadFailed(song, message)
-                return
-            }
-            if (target.exists() && !target.delete()) {
-                pending.remove(key)
-                progress.remove(key)
-                callback?.onDownloadFailed(song, "无法替换旧的歌曲文件")
-                return
-            }
-            if (!downloadedFile.renameTo(target)) {
-                clearBrokenDownload(task, target)
-                retryOrFail(song, callback, attempt, "rename failed", "下载文件落盘失败")
-                return
-            }
-            pending.remove(key)
-            progress.remove(key)
-            song.path = target.absolutePath
-            callback?.onDownloadProgress(song, 100)
-            callback?.onDownloadComplete(song, target.absolutePath)
-        } catch (error: Throwable) {
-            Log.e(TAG, "Finalizing download failed: ${song.title}", error)
-            clearBrokenDownload(task, target)
-            retryOrFail(song, callback, attempt, error.message ?: "finalize failed", "下载文件处理失败")
+            active.forEach { (id, _) -> synchronized(locks.getOrPut(id) { Any() }) { } }
+            clear()
+        } finally { synchronized(this) { resetting = false } }
+    }
+    private fun key(song: Song) = KtvStore.stableId(song)
+    @JvmStatic fun getLocalFile(song: Song): File {
+        if (song.isOpenList()) {
+            val original = song.openListPath.orEmpty().substringAfterLast('/')
+            val safe = original.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            return File(AppPaths.cloudSongsDir, song.id.orEmpty().substringAfter(':').take(12) + "_" + safe)
+        }
+        if (song.sourceSongNumber.isNullOrBlank() && !song.filename.isNullOrBlank()) {
+            val safe = song.filename.orEmpty().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            return File(AppPaths.cloudSongsDir, key(song).hashCode().toUInt().toString(16) + "_" + safe)
+        }
+        val name = song.filename?.takeIf { it.matches(Regex("[A-Za-z0-9_-]+\\.(mkv|mp4|mpg|avi)", RegexOption.IGNORE_CASE)) }
+            ?: "${song.sourceSongNumber ?: key(song).replace(Regex("[^A-Za-z0-9_-]"), "_")}.mkv"
+        return File(AppPaths.cloudSongsDir, name)
+    }
+    private fun cacheDirectories(requireUsb: Boolean = false): List<SongStorage.Directory> {
+        val choices = listOf(SongStorage.Choice(), SongStorage.choice().copy(usb = true))
+        return choices.mapNotNull { choice ->
+            if (requireUsb && choice.usb && choice.tree.isNotBlank()) SongStorage.directory(choice)
+            else runCatching { SongStorage.directory(choice) }.getOrNull()
         }
     }
-
-    private fun retryOrFail(
-        song: Song,
-        callback: DownloadCallback?,
-        attempt: Int,
-        reason: String,
-        terminalMessage: String,
-    ) {
-        if (attempt < MAX_RETRY_COUNT) {
-            retry(song, callback, attempt + 1, reason)
-        } else {
-            val key = songKey(song)
-            pending.remove(key)
-            progress.remove(key)
-            callback?.onDownloadFailed(song, terminalMessage)
+    @JvmStatic fun isDownloaded(song: Song): Boolean {
+        if (song.hasLocalFile()) return true
+        val name = getLocalFile(song).name
+        for (directory in cacheDirectories()) {
+            val target = directory.child(name)
+            val valid = runCatching {
+                val info = JSONObject(directory.child(name + ".complete.json").readText())
+                (if (song.isOpenList()) info.optString("provider") == "openlist" &&
+                    info.optJSONObject("song")?.optString("id") == song.id
+                 else info.optString("provider") == "igeba" &&
+                    info.optString("SongNumber") == song.sourceSongNumber) &&
+                    target.info()?.bytes == info.getLong("bytes") && SongStorage.valid(target)
+            }.getOrDefault(false)
+            if (valid) { song.path = target.path; return true }
+        }
+        return false
+    }
+    @JvmStatic fun isDownloadingFilename(filename: String): Boolean =
+        jobs.values.any { it.filename == filename && !it.cancelled.get() }
+    @JvmStatic fun isDownloading(song: Song): Boolean = jobs[key(song)]?.cancelled?.get() == false
+    @JvmStatic fun getDownloadProgress(song: Song): Int = jobs[key(song)]?.progress ?: if(isDownloaded(song)) 100 else 0
+    @JvmStatic fun cancelDownload(song: Song) {
+        jobs[key(song)]?.let { job ->
+            job.cancelled.set(true); job.connection?.disconnect()
+            job.connections.forEach { it.disconnect() }
         }
     }
-
-    private fun scheduleStallCheck(
-        song: Song,
-        task: OkDownloadTask,
-        lastActivityAt: AtomicLong,
-        attempt: Int,
-    ) {
-        watchdog.schedule({
-            val key = songKey(song)
-            if (tasks[key] !== task) return@schedule
-            val idleMs = System.currentTimeMillis() - lastActivityAt.get()
-            if (idleMs >= STALL_TIMEOUT_MS) {
-                Log.w(TAG, "Download stalled for ${idleMs}ms: ${song.title}, attempt=$attempt")
-                forcedRetryReasons[key] = "stalled for ${idleMs}ms"
-                task.cancel()
-            } else {
-                scheduleStallCheck(song, task, lastActivityAt, attempt)
+    @JvmStatic fun deleteCache(song: Song): Boolean {
+        val destination = jobs[key(song)]?.destination
+        cancelDownload(song)
+        return runCatching { synchronized(locks.getOrPut(key(song)) { Any() }) {
+            val directories = cacheDirectories(requireUsb = true).toMutableList()
+            destination?.let { choice ->
+                runCatching { SongStorage.directory(choice) }.getOrNull()?.let(directories::add)
             }
-        }, STALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            val name = getLocalFile(song).name
+            val deleted = directories.distinctBy { it.file?.absolutePath ?: it.document.toString() }
+                .flatMap { directory ->
+                    listOf("", ".download", ".resume.json", ".complete.json").map { suffix ->
+                        runCatching { directory.child(name + suffix).delete() }.getOrDefault(false)
+                    }
+                }.all { it }
+            if (deleted) song.path = null
+            deleted
+        } }.getOrDefault(false)
     }
-
-    private fun clearBrokenDownload(task: OkDownloadTask, target: File) {
-        runCatching { OkDownload.with().breakpointStore().remove(task.id) }
-        val partial = task.file ?: File(target.parentFile, "${target.name}.download")
-        if (partial.absolutePath != target.absolutePath) partial.delete()
-        File(partial.parentFile, "${partial.name}.decrypted").delete()
-    }
-
-    private fun retry(song: Song, callback: DownloadCallback?, attempt: Int, reason: String) {
-        Log.w(TAG, "Retrying ${song.title}, attempt=$attempt, reason=$reason")
-        val key = songKey(song)
-        pending.add(key)
-        progress[key] = 0
-        callback?.onDownloadProgress(song, 0)
-        song.downloadUrl = null
-        SongApiClient.clearTokenCache()
+    @JvmStatic @Synchronized fun download(song: Song, callback: DownloadCallback?,
+        source: OpenListConfig? = null, cloud: OpenListConfig? = null, copyExisting: Boolean = false) {
+        if (resetting) {
+            callback?.onDownloadFailed(song, "曲库正在重置，请稍后重试")
+            return
+        }
+        if (!copyExisting && cloud == null && isDownloaded(song)) {
+            callback?.onDownloadComplete(song, checkNotNull(song.path)); return
+        }
+        val id=key(song)
+        val job=Job(getLocalFile(song).name, source = source, cloud = cloud, copyExisting = copyExisting)
+        callback?.let(job.callbacks::add)
+        var existing: Job? = null
+        jobs.compute(id) { _, old ->
+            if(old != null && !old.cancelled.get()) { existing=old; old } else job
+        }
+        if(existing != null) { callback?.let(existing!!.callbacks::add); callback?.onDownloadStart(song); return }
         io.execute {
-            Thread.sleep((attempt * 750L).coerceAtMost(2_250L))
-            val url = runCatching { buildDownloadUrl(song, forceRefresh = true) }.getOrDefault("")
-            if (url.isEmpty()) {
-                if (attempt < MAX_RETRY_COUNT) {
-                    retry(song, callback, attempt + 1, "refresh download URL failed")
-                } else {
-                    pending.remove(key)
-                    progress.remove(key)
-                    callback?.onDownloadFailed(song, "刷新下载地址失败")
+            synchronized(locks.getOrPut(id) { Any() }) {
+                try {
+                    if(job.cancelled.get()) return@synchronized
+                    job.callbacks.forEach { it.onDownloadStart(song) }
+                    job.destination = if (cloud == null) SongStorage.prepareDownloadChoice(job.destination) else SongStorage.Choice()
+                    if (cloud != null) {
+                        job.staging = File(KtvApplication.getInstance().cacheDir, "openlist-transfer-" + id.hashCode()).apply {
+                            check(exists() || mkdirs()) { "无法创建上传暂存目录" }
+                        }
+                    }
+                    try {
+                        if (cloud != null && song.openListServer == cloud.server &&
+                            song.openListPath?.let { OpenListPaths.parent(it, cloud.root) == cloud.root } == true) {
+                            job.callbacks.forEach { it.onDownloadComplete(song, song.path.orEmpty()) }
+                        } else if (song.hasLocalFile() && copyExisting) {
+                            copyMedia(song, job, SongStorage.fromPath(checkNotNull(song.path)))
+                        } else if (song.isOpenList()) fetchOpenList(song, job)
+                        else fetch(song, job)
+                    } catch (error: Exception) {
+                        if (!job.destination.usb || job.cancelled.get() || !isUsbStorageFailure(error)) throw error
+                        spaceBudget.release(id)
+                        job.destination = job.destination.copy(usb = false, tree = "")
+                        job.progress = 0
+                        android.util.Log.w("SongOkDownload", "U盘不可用或空间不足，回退本地，歌曲=${song.sourceSongNumber}")
+                        if (song.hasLocalFile() && copyExisting) {
+                            copyMedia(song, job, SongStorage.fromPath(checkNotNull(song.path)))
+                        } else if (song.isOpenList()) fetchOpenList(song, job) else fetch(song, job)
+                    }
+                } catch(error: Exception) {
+                    jobs.remove(id, job)
+                    if(!job.cancelled.get()) job.callbacks.forEach {
+                        it.onDownloadFailed(song, error.message?.take(180) ?: "下载失败")
+                    }
+                } finally {
+                    job.readersStopped.set(true)
+                    job.connections.forEach { it.disconnect() }
+                    job.connection?.disconnect()
+                    val elapsed = (System.nanoTime() - job.createdAt) / 1_000_000
+                    android.util.Log.i("SongOkDownload", "传输统计 song=$id elapsedMs=$elapsed bytes=${job.transferred} requests=${job.requests} headerMs=${job.headerNanos / 1_000_000} readMs=${job.readNanos / 1_000_000} writeMs=${job.writeNanos / 1_000_000} callbackMs=${job.callbackNanos / 1_000_000}")
+                    spaceBudget.release(id)
+                    job.staging?.deleteRecursively()
+                    jobs.remove(id,job)
                 }
-            } else {
-                startDownloadTask(song, url, callback, attempt)
             }
         }
     }
 
-    private fun songKey(song: Song): String = song.id?.takeIf(String::isNotEmpty)
-        ?: song.filename?.takeIf(String::isNotEmpty)
-        ?: song.title.orEmpty()
+    private fun block(url: String, start: Long, wireEnd: Long, job: Job, reportRange: Boolean = false, attemptStopped: AtomicBoolean? = null): Block {
+        if(job.cancelled.get() || job.readersStopped.get() || attemptStopped?.get() == true) throw IOException("下载已暂停")
+        val connection=URL(url).openConnection() as HttpURLConnection
+        job.connections.add(connection)
+        if (job.cancelled.get() || job.readersStopped.get() || attemptStopped?.get() == true ||
+            Thread.currentThread().isInterrupted) {
+            job.connections.remove(connection); connection.disconnect()
+            throw IOException("下载已暂停")
+        }
+        val requestStarted = System.nanoTime()
+        if (reportRange) synchronized(job) { job.inFlight[start] = 0L }
+        try {
+            connection.connectTimeout=15_000; connection.readTimeout=30_000
+            connection.setRequestProperty("Range","bytes=$start-$wireEnd")
+            connection.setRequestProperty("Accept-Encoding","identity")
+            val code=connection.responseCode
+            synchronized(job) { job.headerNanos += System.nanoTime() - requestStarted; job.requests++ }
+            if(code != 206) {
+                val detail = connection.errorStream?.use { input ->
+                    val data = ByteArray(512); val count = input.read(data)
+                    if (count > 0) String(data, 0, count, Charsets.UTF_8) else ""
+                }.orEmpty()
+                throw MediaHttpException(code, if (detail.contains("expired", true)) "URL expired" else connection.responseMessage.orEmpty())
+            }
+            val readStarted = System.nanoTime()
+            val range=MediaRangeProtocol.parse(connection.getHeaderField("Content-Range"),start)
+            val end=range.end
+            val total=range.total
+            val expected=range.byteCount
+            val data=ByteArray(expected)
+            connection.inputStream.use { input ->
+                var at=0
+                while(at < expected) {
+                    if(job.cancelled.get() || job.readersStopped.get() || attemptStopped?.get() == true || Thread.currentThread().isInterrupted) throw IOException("下载已暂停")
+                    val n=input.read(data,at,expected-at)
+                    if (attemptStopped?.get() == true || job.cancelled.get()) throw IOException("下载已暂停")
+                    if(n < 0) throw IOException("媒体分段不完整")
+                    synchronized(job) {
+                        if (job.startedAt == 0L) job.startedAt = System.nanoTime()
+                        job.transferred += n
+                        job.total = total
+                        if (reportRange) job.inFlight[start] = (at + n).toLong()
+                    }
+                    at+=n
+                }
+                if(input.read() != -1) throw IOException("分段长度超出声明范围")
+            }
+            synchronized(job) { job.readNanos += System.nanoTime() - readStarted }
+            return Block(data,end,total)
+        } finally { connection.disconnect(); job.connections.remove(connection) }
+    }
 
+    private fun isUsbStorageFailure(error: Exception): Boolean {
+        if (error is MediaHttpException) return false
+        if (error is DownloadSpaceBudget.InsufficientSpace) return true
+        val causes = generateSequence<Throwable>(error) { it.cause }.take(8).toList()
+        return causes.any { cause ->
+            cause is android.system.ErrnoException && cause.errno in setOf(
+                android.system.OsConstants.ENOSPC, android.system.OsConstants.EROFS,
+                android.system.OsConstants.ENODEV, android.system.OsConstants.EIO,
+                android.system.OsConstants.EACCES, android.system.OsConstants.ENOENT)
+        } || error.message.orEmpty().let { message ->
+            message.contains("U盘") || message.contains("歌曲目录") ||
+                message.contains("No space left", true) || message.contains("Read-only file system", true)
+        }
+    }
+
+    private fun destination(job: Job): SongStorage.Directory =
+        job.staging?.let { SongStorage.Directory(file = it) }
+            ?: checkNotNull(SongStorage.directory(job.destination, true)) { "保存位置不可用" }
+
+    private fun progress(song: Song, job: Job, value: Int) {
+        job.progress = value.coerceIn(0, 99)
+        val now = System.nanoTime()
+        if (job.progress == job.lastProgressValue || now - job.lastProgressTime < 250_000_000L) return
+        job.lastProgressTime = now
+        job.lastProgressValue = job.progress
+        val begin = System.nanoTime()
+        job.callbacks.forEach { it.onDownloadProgress(song, job.progress) }
+        job.callbackNanos += System.nanoTime() - begin
+    }
+
+    private fun upload(song: Song, job: Job, media: SongStorage.Media) {
+        val config = checkNotNull(job.cloud)
+        val extension = media.name.substringAfterLast('.', "mkv")
+        val clean = "${song.singer.orEmpty()}-${song.title.orEmpty()}"
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_").take(180).ifBlank { "歌曲" }
+        val name = if (!song.sourceSongNumber.isNullOrBlank()) job.filename else "$clean.$extension"
+        val path = OpenListPaths.child(config.root, name)
+        val size = media.info()?.bytes ?: error("无法读取歌曲长度")
+        media.input().use { input ->
+            OpenListClient(config).upload(path, size, input, { job.cancelled.get() },
+                { progress(song, job, 50 + it / 2) }, { job.connection = it })
+        }
+        song.openListServer = config.server
+        song.openListPath = path
+        song.downloadUrl = null; song.videoUrl = null
+        job.callbacks.forEach { it.onDownloadComplete(song, song.path.orEmpty()) }
+    }
+
+    private fun copyMedia(song: Song, job: Job, source: SongStorage.Media) {
+        if (job.cloud != null) { upload(song, job, source); return }
+        val size = source.info()?.bytes ?: error("无法读取歌曲长度")
+        source.input().use { saveStream(song, job, size, it) }
+    }
+
+    private fun fetchOpenList(song: Song, job: Job) {
+        val config = checkNotNull(job.source) { "请先连接网盘" }
+        check(config.server == song.openListServer) { "请连接歌曲所属的网盘" }
+        val path = checkNotNull(song.openListPath)
+        check(OpenListPaths.within(path, config.root)) { "歌曲超出网盘目录范围" }
+        val url = OpenListClient(config).resolve(path)
+        val connection = URL(url).openConnection() as HttpURLConnection
+        job.connection = connection
+        try {
+            connection.connectTimeout = 15000
+            connection.readTimeout = 30000
+            connection.setRequestProperty("Accept-Encoding", "identity")
+            check(connection.responseCode == 200) { "网盘媒体下载失败" }
+            val size = connection.getHeaderField("Content-Length")?.toLongOrNull()
+                ?: error("网盘未返回歌曲长度，请启用代理下载")
+            connection.inputStream.use { saveStream(song, job, size, it) }
+        } finally { connection.disconnect(); if (job.connection === connection) job.connection = null }
+    }
+
+    private fun saveStream(song: Song, job: Job, size: Long, input: java.io.InputStream) {
+        check(size >= MIN_VALID_FILE_SIZE) { "歌曲文件过小" }
+        val directory = destination(job)
+        val target = directory.child(job.filename)
+        if (target.path == song.path && SongStorage.valid(target)) {
+            job.callbacks.forEach { it.onDownloadComplete(song, checkNotNull(song.path)) }
+            return
+        }
+        val partial = directory.child(job.filename + ".download")
+        var received = 0L
+        var nextSpaceCheck = 0L
+        partial.writer().use { output ->
+            output.reset()
+            val buffer = ByteArray(64 * 1024)
+            while (received < size) {
+                check(!job.cancelled.get()) { "保存已暂停" }
+                if (received >= nextSpaceCheck) {
+                    spaceBudget.reserve(key(song), SongStorage.volumeKey(job.destination),
+                        size - received, output.available(), job.destination.reserveBytes)
+                    nextSpaceCheck = received + CHUNK
+                }
+                val count = input.read(buffer, 0, minOf(buffer.size.toLong(), size - received).toInt())
+                check(count > 0) { "歌曲下载不完整" }
+                val writeStarted = System.nanoTime()
+                output.write(buffer, 0, count)
+                job.writeNanos += System.nanoTime() - writeStarted
+                if (job.startedAt == 0L) job.startedAt = System.nanoTime()
+                job.transferred += count
+                job.received = received + count
+                job.total = size
+                received += count
+                progress(song, job, ((received * (if (job.cloud == null) 99 else 49)) / size).toInt())
+            }
+            check(input.read() == -1) { "歌曲长度超出声明范围" }
+            output.sync()
+            check(output.size() == size) { "歌曲长度校验失败" }
+        }
+        check(!job.cancelled.get()) { "保存已暂停" }
+        check(SongStorage.valid(partial)) { "歌曲媒体校验失败" }
+        check(target.delete() && partial.renameTo(target)) { "保存歌曲失败" }
+        if (target is SongStorage.FileMedia) SongFileValidator.forget(target.file)
+        if (!SongStorage.valid(target)) { target.delete(); error("歌曲媒体校验失败") }
+        if (job.cloud != null) { upload(song, job, target); return }
+        song.path = target.path
+        directory.child(job.filename + ".complete.json").writeText(JSONObject()
+            .put("provider", if (song.isOpenList()) "openlist" else "igeba")
+            .put("SongNumber", song.sourceSongNumber).put("bytes", size).put("song", song.toJson()).toString())
+        PersonalMediaStore.remember(song)
+        job.callbacks.forEach { it.onDownloadComplete(song, checkNotNull(song.path)) }
+    }
+
+    private class MediaHttpException(val code: Int, val detail: String): IOException("媒体服务器 HTTP $code: $detail")
+    private fun fetch(song: Song, job: Job) {
+        val number=song.sourceSongNumber ?: throw IOException("该条目没有新歌源编号，无法下载")
+        val attemptStopped = AtomicBoolean(false)
+        synchronized(job) { job.inFlight.clear() }
+        val downloadSession = IgebaAccount.session ?: throw IOException("请先登录 i歌霸账号")
+        val userId = downloadSession.userId
+        var address=IgebaApiClient.address(number, userId)
+        val addressLock = Any()
+        var exclusive=false
+        var mediaTotal: Long? = null
+        fun probe(): Block {
+            val result=block(address.url,0,63,job, attemptStopped = attemptStopped)
+            val range=MediaRangeProtocol.ResponseRange(0,result.end,result.total)
+            exclusive=MediaRangeProtocol.exclusiveNode(range)
+            if(mediaTotal != null && mediaTotal != result.total) throw IOException("更新地址后媒体长度发生变化")
+            if(!result.bytes.take(4).toByteArray().contentEquals(byteArrayOf(0x1a,0x45,0xdf.toByte(),0xa3.toByte()))) {
+                throw IOException("歌源返回的不是已验证的 MKV 媒体")
+            }
+            mediaTotal=result.total
+            return result
+        }
+        fun notifyOrder() {
+            val snapshot = java.util.concurrent.FutureTask {
+                orderSnapshot?.invoke().orEmpty()
+                    .filter { it.matches(Regex("\\d{1,16}")) }.toMutableList()
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post(snapshot)
+            val orders = snapshot.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (number !in orders) orders.add(number)
+            IgebaApiClient.post("NOTIFY_MYORDER", JSONObject()
+                .put("UserId", userId).put("Action", 1)
+                .put("SongNumbers", number).put("Orders", orders.joinToString(",")), true)
+        }
+        val recovery = IgebaDownloadRecovery(
+            notifyOrder = { notifyOrder() },
+            refreshAddress = {
+                check(IgebaAccount.session?.userId == userId) { "账号已变更，请重试下载" }
+                address = IgebaApiClient.address(number, userId)
+            },
+            relogin = {
+                if (job.cancelled.get()) throw IOException("下载已暂停")
+                IgebaAccount.relogin(downloadSession)
+                android.util.Log.i("SongOkDownload", "已恢复当前账号登录，重新获取歌曲地址")
+            },
+        )
+        fun refresh(error: MediaHttpException) {
+            if (job.cancelled.get()) throw IOException("下载已暂停")
+            if (!recovery.recover(error.code, error.detail)) throw error
+        }
+        fun retryExpired(request: () -> Block): Block {
+            while (true) {
+                try { return request() }
+                catch (error: MediaHttpException) { refresh(error) }
+            }
+        }
+        val initialProbe=retryExpired { probe() }
+        fun read(start: Long, stopExclusive: Long, reportRange: Boolean = false): Block {
+            while (true) {
+                val snapshot = synchronized(addressLock) { address.url to exclusive }
+                try {
+                    return block(snapshot.first, start,
+                        MediaRangeProtocol.wireEnd(stopExclusive, snapshot.second), job, reportRange, attemptStopped)
+                } catch (error: MediaHttpException) {
+                    synchronized(addressLock) {
+                        if (snapshot.first == address.url) {
+                            refresh(error)
+                            retryExpired { probe() }
+                        }
+                    }
+                }
+            }
+        }
+        song.sourceVoiceChannel=address.voiceChannel
+        val directory=destination(job)
+        val capacity = SongStorage.capacity(job.destination)
+        android.util.Log.i("SongOkDownload", "保存位置 usb=${job.destination.usb} path=${directory.file?.absolutePath ?: directory.document} available=${capacity.available} reserve=${job.destination.reserveBytes} songBytes=${initialProbe.total}")
+        val target=directory.child(job.filename)
+        val partial=directory.child(job.filename+".download")
+        val resume=directory.child(job.filename+".resume.json")
+        val metadata=runCatching { JSONObject(resume.readText()) }.getOrNull()
+        var offset=partial.info()?.bytes?.coerceAtLeast(0) ?: 0L
+        if(metadata?.optLong("bytes") != initialProbe.total || metadata?.optString("SongNumber") != number || offset > initialProbe.total) {
+            offset=0
+        }
+        if(offset > 0) {
+            val start=(offset-65_536).coerceAtLeast(0)
+            val tail=read(start,offset)
+            val previous=partial.readAt(start,(offset-start).toInt())
+            if(tail.total != initialProbe.total || !tail.bytes.contentEquals(previous)) offset=0
+        }
+        resume.writeText(JSONObject().put("SongNumber",number).put("bytes",initialProbe.total).toString())
+        partial.writer().use { output ->
+            fun checkSpace() {
+                try {
+                    spaceBudget.reserve(key(song), SongStorage.volumeKey(job.destination),
+                        initialProbe.total-offset, output.available(), job.destination.reserveBytes)
+                } catch (shortage: DownloadSpaceBudget.InsufficientSpace) {
+                    if (!SongStorage.automaticCleanup || resetting || job.cancelled.get()) throw shortage
+                    reclaimCache?.invoke(job.destination, shortage.requiredAvailable)
+                    if (job.cancelled.get()) throw IOException("下载已暂停")
+                    spaceBudget.reserve(key(song), SongStorage.volumeKey(job.destination),
+                        initialProbe.total-offset, output.available(), job.destination.reserveBytes)
+                }
+            }
+            if(offset==0L) output.reset()
+            checkSpace()
+            if(offset==0L) { output.write(initialProbe.bytes); offset=initialProbe.bytes.size.toLong(); checkSpace() }
+            output.position(offset)
+            synchronized(job) { job.received = offset; job.total = initialProbe.total }
+            try {
+                OrderedRangePrefetch.transfer(offset, initialProbe.total, CHUNK, rangeIo,
+                    { job.cancelled.get() || attemptStopped.get() },
+                    { start, stop -> read(start, stop, true) },
+                    { start, stop, data ->
+                        if (start != offset || data.total != initialProbe.total || data.end != stop - 1 ||
+                            data.bytes.size.toLong() != stop - start) throw IOException("媒体长度或分段发生变化")
+                        checkSpace()
+                        val writeStarted = System.nanoTime()
+                        output.write(data.bytes)
+                        job.writeNanos += System.nanoTime() - writeStarted
+                        offset = stop
+                        synchronized(job) { job.received = offset; job.inFlight.remove(start) }
+                        checkSpace()
+                        progress(song, job, (offset * 100 / initialProbe.total).toInt())
+                    })
+            } finally {
+                attemptStopped.set(true)
+                job.connections.forEach { it.disconnect() }
+            }
+            output.sync()
+            check(output.size()==initialProbe.total) { "完整文件长度校验失败" }
+        }
+        if(job.cancelled.get()) throw IOException("下载已暂停")
+        check(target.delete()) { "无法替换旧歌曲缓存" }
+        val marker=directory.child(job.filename+".complete.json")
+        check(marker.delete()) { "无法清理旧歌曲校验文件" }
+        check(partial.renameTo(target)) { "无法保存下载文件" }
+        if(target is SongStorage.FileMedia) SongFileValidator.forget(target.file)
+        if(!SongStorage.valid(target)) { target.delete(); throw IOException("下载媒体容器校验失败") }
+        if (job.cloud != null) {
+            upload(song, job, target)
+            resume.delete()
+            return
+        }
+        song.path=checkNotNull(target.path); song.downloadUrl=null; song.videoUrl=null
+        marker.writeText(JSONObject().put("provider","igeba").put("SongNumber",number)
+            .put("bytes",initialProbe.total).put("song",song.toJson()).toString())
+        resume.delete()
+        PersonalMediaStore.remember(song)
+        job.progress=100
+        job.callbacks.forEach { it.onDownloadComplete(song,checkNotNull(song.path)) }
+    }
 }

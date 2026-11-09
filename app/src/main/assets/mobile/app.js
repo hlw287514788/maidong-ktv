@@ -3,7 +3,7 @@ const $$ = (selector) => document.querySelectorAll(selector);
 const uiState = {
   page: 1, query: "", searchMode: "singer", busy: false,
   hotPage: 1, hotPageSize: 10, hotBusy: false,
-  visible: true, connected: false
+  visible: true, connected: false, heartbeatFailures: 0
 };
 
 function escapeHtml(value) {
@@ -21,15 +21,25 @@ function setConnected(connected) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    cache: "no-store",
-    headers: { "Content-Type": "application/json" },
-    ...options
-  });
-  const data = await response.json();
-  if (!response.ok || data.ok === false) throw new Error(data.error || "操作失败");
-  setConnected(true);
-  return data;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 8000);
+  try {
+    let response;
+    try {
+      response = await fetch(path, {
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        ...options,
+        signal: controller.signal
+      });
+    } catch (error) { throw error; }
+    // A server response proves connectivity even when an operation is rejected.
+    setConnected(true);
+    uiState.heartbeatFailures = 0;
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || "操作失败");
+    return data;
+  } finally { window.clearTimeout(timeout); }
 }
 
 function toast(text) {
@@ -39,14 +49,24 @@ function toast(text) {
   window.setTimeout(() => element.classList.remove("show"), 1600);
 }
 
+/* Display-only source label. Falls back to the stock binary payload when the
+   server does not provide `source` (e.g. an older TV build). */
+function sourceLabel(song) {
+  if (song.source === "local") return ["本地", "ok"];
+  if (song.source === "nas") return ["NAS 直读", "ok"];
+  if (song.source === "online") return ["需下载", "warn"];
+  return song.local === true ? ["本地", "ok"] : ["在线", "warn"];
+}
+
 function songRow(song, queue = false, current = false, index = 0, ranking = false) {
   const number = current ? "♪" : String(index + 1).padStart(2, "0");
+  const [label, tone] = sourceLabel(song);
   const actions = queue && !current
     ? '<button class="top">置顶</button><button class="delete" aria-label="删除">×</button>'
     : !queue ? '<button class="order">点歌</button>' : "";
   return `<div class="song${ranking && index < 3 ? " podium" : ""}" data-id="${escapeHtml(song.id)}">
     <div class="song-index">${number}</div>
-    <div class="info">${current ? '<span class="playing">正在播放</span>' : ""}<b>${escapeHtml(song.title)}</b><p>${escapeHtml(song.singer)}${song.language ? " · " + escapeHtml(song.language) : ""}</p></div>
+    <div class="info">${current ? '<span class="playing">正在播放</span>' : ""}<b>${escapeHtml(song.title)}</b><p><span class="source-badge ${tone}">${label}</span>${escapeHtml(song.singer)}${song.language ? " · " + escapeHtml(song.language) : ""}</p></div>
     ${actions}
   </div>`;
 }
@@ -59,7 +79,10 @@ function openPage(name) {
   if (name === "search" && !$("#hotList").children.length) loadHot(1);
 }
 
+let refreshing = false;
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
   try {
     const data = await api("/api/v1/state");
     const current = data.current || {};
@@ -79,9 +102,13 @@ async function refresh() {
     $("#original").classList.toggle("active", data.vocalMode === "original");
     $("#accompany").classList.toggle("active", data.vocalMode !== "original");
     $("#nextSong").textContent = data.next?.title || "队列为空";
-  } catch (_) {
-    setConnected(false);
-  }
+  } catch (error) {
+    // A slow search or suspended mobile tab is not proof of a lost LAN connection.
+    // Only consecutive heartbeat failures change the connectivity indicator.
+    uiState.heartbeatFailures += 1;
+    if (uiState.heartbeatFailures >= 3) setConnected(false);
+    console.warn('状态更新失败', error.message);
+  } finally { refreshing = false; }
 }
 
 async function playerAction(action) {
@@ -119,7 +146,7 @@ async function search(reset = true) {
     const rows = (data.songs || []).map((song, index) => songRow(song, false, false, (uiState.page - 1) * 20 + index)).join("");
     if (rows) $("#results").insertAdjacentHTML("beforeend", rows);
     else if (reset) $("#results").innerHTML = '<div class="empty">没有找到相关歌曲<br><small>请更换关键词后重试</small></div>';
-    $("#resultSummary").textContent = `“${uiState.query}”${data.hasMore ? "，还有更多" : ""}`;
+    $("#resultSummary").textContent = `“${uiState.query}” · 本地优先${data.hasMore ? "，还有更多" : ""}`;
     $("#more").classList.toggle("hidden", !data.hasMore);
     uiState.page += 1;
   } catch (error) { toast(error.message); }
@@ -140,7 +167,7 @@ async function loadHot(page) {
       songRow(song, false, false, (uiState.hotPage - 1) * uiState.hotPageSize + index, true)
     ).join("") || '<div class="empty compact">暂无热歌排行</div>';
     $("#hotPage").textContent = `第 ${uiState.hotPage} 页`;
-    $("#hotSummary").textContent = songs.length ? `第 ${(uiState.hotPage - 1) * uiState.hotPageSize + 1}-${(uiState.hotPage - 1) * uiState.hotPageSize + songs.length} 名` : "暂无数据";
+    $("#hotSummary").textContent = songs.length ? `第 ${(uiState.hotPage - 1) * uiState.hotPageSize + 1}-${(uiState.hotPage - 1) * uiState.hotPageSize + songs.length} 首 · 本地优先` : "暂无数据";
     $("#hotPrev").disabled = !data.hasPrevious;
     $("#hotNext").disabled = !data.hasMore;
     if (page > 1) $("#hot").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -207,7 +234,26 @@ $("#hotNext").addEventListener("click", () => loadHot(uiState.hotPage + 1));
   $("#" + kind + "Volume").addEventListener("input", (event) => { $("#" + kind + "Value").textContent = event.target.value; });
   $("#" + kind + "Volume").addEventListener("change", (event) => updateAudio({ [kind + "Volume"]: Number(event.target.value) }));
 });
-document.addEventListener("visibilitychange", () => { uiState.visible = !document.hidden; if (uiState.visible) refresh(); });
-window.setInterval(() => { if (uiState.visible) refresh(); }, 1000);
-refresh();
+let heartbeatTimer;
+let heartbeatRunning = false;
+async function heartbeat() {
+  if (heartbeatRunning) return;
+  heartbeatRunning = true;
+  window.clearTimeout(heartbeatTimer);
+  try {
+    if (uiState.visible) await refresh();
+  } finally {
+    heartbeatRunning = false;
+    heartbeatTimer = window.setTimeout(heartbeat,
+      uiState.connected ? 1500 : Math.min(8000, 1500 * (uiState.heartbeatFailures + 1)));
+  }
+}
+function resumeConnection() {
+  uiState.visible = !document.hidden;
+  if (uiState.visible) heartbeat();
+}
+document.addEventListener("visibilitychange", resumeConnection);
+window.addEventListener("pageshow", resumeConnection);
+window.addEventListener("online", resumeConnection);
+heartbeat();
 loadHot(1);

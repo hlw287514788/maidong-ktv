@@ -30,6 +30,9 @@ class KtvStore {
     @JvmField var clearDownloadsOnBoot = false
     @JvmField var autoFullscreenSeconds = 0
     @JvmField var showUsbSongs = true
+    @JvmField var downloadToUsb = false
+    @JvmField var downloadToOpenList = false
+    @JvmField var usbTreeUri = ""
     @JvmField var autoDeleteSongs = true
     @JvmField var reserveStorageGb = 1.0
     @JvmField var floatingButtonEnabled = true
@@ -41,8 +44,7 @@ class KtvStore {
     @JvmField var voiceEngineVolume = 70
     @JvmField var lightMode = "自动"
     @JvmField var audioDelayMs = 0
-    @JvmField var screenBrightness = 80
-    @JvmField var screenMode = "适应屏幕"
+    @JvmField var screenMode = "16 : 9"
     @JvmField var doubleScreenEnabled = false
     @JvmField var tableBroadcastEnabled = true
     @JvmField var tableBroadcastSeconds = 8
@@ -58,8 +60,7 @@ class KtvStore {
 
     fun load() {
         runCatching {
-            if (!file.exists()) return@runCatching
-            val root = JSONObject(file.readText())
+            val root = JSONObject(android.util.AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { it.readText() })
             loopOne = root.optBoolean("loopOne", false)
             autoNext = root.optBoolean("autoNext", true)
             originalVocal = root.optBoolean("originalVocal", false)
@@ -79,8 +80,11 @@ class KtvStore {
             clearDownloadsOnBoot = root.optBoolean("clearDownloadsOnBoot", false)
             autoFullscreenSeconds = root.optInt("autoFullscreenSeconds", 0)
             showUsbSongs = root.optBoolean("showUsbSongs", true)
+            downloadToUsb = root.optBoolean("downloadToUsb", false)
+            downloadToOpenList = root.optBoolean("downloadToOpenList", false)
+            usbTreeUri = root.optString("usbTreeUri", "")
             autoDeleteSongs = root.optBoolean("autoDeleteSongs", true)
-            reserveStorageGb = root.optDouble("reserveStorageGb", 1.0).coerceIn(0.5, 64.0)
+            reserveStorageGb = root.optDouble("reserveStorageGb", 1.0).let { if (it.isFinite()) it.coerceIn(0.0, 64.0) else 1.0 }
             floatingButtonEnabled = root.optBoolean("floatingButtonEnabled", true)
             songTitleSubtitleEnabled = root.optBoolean("songTitleSubtitleEnabled", true)
             orderedSongOriginal = root.optBoolean("orderedSongOriginal", false)
@@ -90,8 +94,8 @@ class KtvStore {
             voiceEngineVolume = root.optInt("voiceEngineVolume", 70)
             lightMode = root.optString("lightMode", "自动")
             audioDelayMs = root.optInt("audioDelayMs", 0)
-            screenBrightness = root.optInt("screenBrightness", 80)
-            screenMode = root.optString("screenMode", "适应屏幕")
+            screenMode = root.optString("screenMode", "16 : 9")
+                .takeIf { it != "适应屏幕" } ?: "16 : 9"
             doubleScreenEnabled = root.optBoolean("doubleScreenEnabled", false)
             tableBroadcastEnabled = root.optBoolean("tableBroadcastEnabled", true)
             tableBroadcastSeconds = root.optInt("tableBroadcastSeconds", 8)
@@ -142,6 +146,9 @@ class KtvStore {
                 put("clearDownloadsOnBoot", clearDownloadsOnBoot)
                 put("autoFullscreenSeconds", autoFullscreenSeconds)
                 put("showUsbSongs", showUsbSongs)
+                put("downloadToUsb", downloadToUsb)
+                put("downloadToOpenList", downloadToOpenList)
+                put("usbTreeUri", usbTreeUri)
                 put("autoDeleteSongs", autoDeleteSongs)
                 put("reserveStorageGb", reserveStorageGb)
                 put("floatingButtonEnabled", floatingButtonEnabled)
@@ -153,7 +160,6 @@ class KtvStore {
                 put("voiceEngineVolume", voiceEngineVolume)
                 put("lightMode", lightMode)
                 put("audioDelayMs", audioDelayMs)
-                put("screenBrightness", screenBrightness)
                 put("screenMode", screenMode)
                 put("doubleScreenEnabled", doubleScreenEnabled)
                 put("tableBroadcastEnabled", tableBroadcastEnabled)
@@ -173,18 +179,34 @@ class KtvStore {
             root.toString(2)
         }.getOrDefault("{}")
 
-    fun writeSnapshot(snapshot: String) {
+    @Synchronized fun writeSnapshot(snapshot: String) {
         runCatching {
+            val json = JSONObject(snapshot)
+            check(json.has("favoriteIds") && json.has("playlistSongs")) { "个人记录快照不完整" }
             file.parentFile?.mkdirs()
-            file.writeText(snapshot)
-        }
+            val atomic = android.util.AtomicFile(file)
+            val output = atomic.startWrite()
+            try {
+                output.write(snapshot.toByteArray(Charsets.UTF_8))
+                atomic.finishWrite(output)
+            } catch (error: Exception) {
+                atomic.failWrite(output)
+                throw error
+            }
+        }.onFailure { android.util.Log.e("KtvStore", "个人记录保存失败", it) }
     }
 
-    fun toggleFavorite(song: Song): Boolean = toggleId(favoriteIds, stableId(song))
+    fun toggleFavorite(song: Song): Boolean {
+        PersonalMediaStore.remember(song)
+        return toggleId(favoriteIds, stableId(song))
+    }
 
     fun isFavorite(song: Song): Boolean = stableId(song) in favoriteIds
 
-    fun togglePlaylistSong(playlist: String, song: Song): Boolean = toggleId(songsInPlaylist(playlist), stableId(song))
+    fun togglePlaylistSong(playlist: String, song: Song): Boolean {
+        PersonalMediaStore.remember(song)
+        return toggleId(songsInPlaylist(playlist), stableId(song))
+    }
 
     fun isInPlaylist(playlist: String, song: Song): Boolean = stableId(song) in songsInPlaylist(playlist)
 

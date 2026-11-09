@@ -3,31 +3,44 @@ plugins {
     id "org.jetbrains.kotlin.android"
 }
 
+// 完整编译大型 TV 页面时，避免继承默认 512 MiB 导致编译器反复回收内存。
+kotlin {
+    kotlinDaemonJvmArgs = ["-Xmx2g", "-XX:MaxMetaspaceSize=768m"]
+}
+
 android {
     namespace "com.local.ktv"
     compileSdk 35
+    ndkVersion "27.0.12077973"
+
+    externalNativeBuild {
+        ndkBuild { path file("src/main/cpp/Android.mk") }
+    }
 
     defaultConfig {
         applicationId "com.local.ktv"
         minSdk 21
-        targetSdk 25
-        versionCode 4
-        versionName "1.2.3"
-        ndk {
-            // Package each ABI's complete IJK set; never mix individual SOs across the two sets.
-            abiFilters "armeabi-v7a", "arm64-v8a"
+        externalNativeBuild {
+            ndkBuild {
+                arguments "NDK_APPLICATION_MK:=${file('src/main/cpp/Application.mk').absolutePath}"
+                if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+                    arguments "HOST_OS=windows", "HOST_ARCH=x86_64"
+                }
+            }
         }
-        def manifestUrl = project.findProperty("GITEE_DATABASE_MANIFEST_URL") ?: ""
-        buildConfigField "String", "GITEE_DATABASE_MANIFEST_URL", "\"${manifestUrl}\""
-        def giteeToken = project.findProperty("GITEE_DATABASE_TOKEN") ?: ""
-        buildConfigField "String", "GITEE_DATABASE_TOKEN", "\"${giteeToken}\""
+        targetSdk 25
+        versionCode 13
+        versionName "2.1.10"
 
     }
+
+    // 回归媒体保存在应用测试目录，不打包进交付 APK。
+
 
     // 签名配置:使用已有的 ktv_keystore.jks
     signingConfigs {
         release {
-            storeFile file("../../ktv_keystore.jks")
+            storeFile rootProject.file("ktv_keystore.jks")
             storePassword "123456"
             keyAlias "ktv"
             keyPassword "123456"
@@ -36,6 +49,8 @@ android {
 
     buildTypes {
         release {
+            // 正式版面向 32/64 位 ARM 电视盒子。
+            ndk { abiFilters "armeabi-v7a", "arm64-v8a" }
             minifyEnabled true
             shrinkResources true
             signingConfig signingConfigs.release
@@ -44,12 +59,17 @@ android {
         debug {
             debuggable true
             applicationIdSuffix ".qa"
+            // 模拟器使用原生 x86 库，避免 ARM 转译影响软件解码验证。
+            ndk { abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64" }
         }
     }
 
+
     // 支持 .ts 视频文件(aapt 不压缩这些文件以避免 SoundPool/MediaPlayer 问题)
     androidResources {
-        noCompress 'ts', 'mp3', 'mp4', 'aac', 'm4a', 'flac', 'wav'
+        ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~" +
+            (project.hasProperty("includeDecoderSamples") ? "" : ":decoder-samples")
+        noCompress 'mkv', 'ts', 'mp3', 'mp4', 'aac', 'm4a', 'flac', 'wav'
     }
 
     // 关闭发布构建的 lint vital 检查(本地分发的 APK 不需要 Google Play 上架要求)
@@ -64,6 +84,7 @@ android {
     }
 
     compileOptions {
+        coreLibraryDesugaringEnabled true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -74,22 +95,16 @@ android {
 
 }
 
-// 强制统一 Kotlin 标准库版本,避免 appcompat 与其他依赖的版本冲突
-configurations.all {
-    resolutionStrategy {
-        force "org.jetbrains.kotlin:kotlin-stdlib:1.8.22"
-        force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22"
-        force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22"
-        force "org.jetbrains.kotlin:kotlin-stdlib-common:1.8.22"
-    }
-}
+// Kotlin 标准库使用当前 Kotlin 插件匹配的版本。
 
 dependencies {
-    implementation files('libs/original-ijk-runtime.jar')
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
+    implementation "androidx.media3:media3-exoplayer:1.7.1"
+    implementation "io.github.anilbeesetti:nextlib-media3ext:1.7.1-0.9.0"
     implementation "androidx.core:core:1.12.0"
     implementation "androidx.appcompat:appcompat:1.6.1"
     implementation "com.google.zxing:core:3.5.3"
-    implementation "com.liulishuo.okdownload:okdownload:1.0.7"
     testImplementation "junit:junit:4.13.2"
+    testImplementation "org.json:json:20240303"
 
 }

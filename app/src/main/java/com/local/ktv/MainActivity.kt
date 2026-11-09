@@ -67,19 +67,18 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.local.ktv.KtvStore.Companion.stableId
 import com.local.ktv.Song.Companion.local
-import com.local.ktv.SongApiClient.getSongDownloadUrl
-import com.local.ktv.SongApiClient.init
 import com.local.ktv.SongOkDownloadManager.DownloadCallback
 import com.local.ktv.SongOkDownloadManager.download
 import com.local.ktv.SongOkDownloadManager.getLocalFile
 import com.local.ktv.SongOkDownloadManager.isDownloaded
 import com.local.ktv.player.PlayerControllerView
 import com.local.ktv.player.PlayerControllerView.OnControlListener
+import com.local.ktv.player.DecoderRecoveryState
 import com.local.ktv.player.KtvPlaybackEngine
 import com.local.ktv.player.KtvVideoView
 import com.local.ktv.player.VocalSwitchHelper
 import com.local.ktv.player.VocalSwitchHelper.switchVocal
-import tv.danmaku.ijk.media.player.IjkMediaPlayer
+import com.local.ktv.player.AudioChannels
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -135,6 +134,12 @@ class MainActivity : AppCompatActivity() {
     private val io: ExecutorService = Executors.newFixedThreadPool(4)
     private val stateIo: ExecutorService = Executors.newSingleThreadExecutor()
     private val library = SongLibrary()
+    private val openListBrowser by lazy { OpenListBrowser(this, io) {
+        refreshLibrary {
+            showSettingsSection(1, false)
+            toast("网盘配置已更新，选择网盘存储后点击“立即加歌”扫描歌曲")
+        }
+    } }
     private lateinit var stateDatabase: KtvStateDatabase
     private lateinit var playbackEngine: KtvPlaybackEngine
 
@@ -154,8 +159,9 @@ class MainActivity : AppCompatActivity() {
     private val remoteNetworkMonitor = object : Runnable {
         override fun run() {
             val ip = localIp().takeIf { LocalRemoteServer.isPrivateIpv4(it) }
-            if (ip != remoteServer.address()) {
-                remoteServer.stop()
+            // The listener binds all LAN interfaces. A transient missing address must not
+            // terminate phone requests or move the listening port.
+            if (ip != null && (ip != remoteServer.address() || !remoteServer.isRunning())) {
                 startRemoteServer()
                 updateMobileQrOverlay()
                 updateFullScreenQrOverlay()
@@ -191,7 +197,7 @@ class MainActivity : AppCompatActivity() {
     /** 播放器控制层(叠加在 player 之上)  */
     private var playerController: PlayerControllerView? = null
     private var currentMediaPlayer: MediaPlayer? = null
-    private var vocalPlayer: MediaPlayer? = null
+    private var vocalPlayer: KtvPlaybackEngine? = null
     private var embeddedVocalEngine: KtvPlaybackEngine? = null
     private var vocalPlayerPrepared = false
     private var pendingVocalPosition = 0
@@ -256,12 +262,13 @@ class MainActivity : AppCompatActivity() {
 
     /** 当前浏览模式的总页数  */
     private var browseTotalPages = 0
+    private val favoriteSongs = ArrayList<Song>()
 
     /** 原版一屏展示量：歌曲 2x5、歌手 4x2、排行榜 1x6。 */
     private fun browsePageSize(): Int = when (browseMode) {
-        "rank" -> 6
+        "rank", "ordered", "sang", "downloads" -> 6
         "singer_list" -> 8
-        else -> MuseDatabase.PAGE_SIZE
+        else -> IgebaCatalog.PAGE_SIZE
     }
 
     /** 当前浏览类型:"hot"/"language"/"wordcount"/"singer"/"search"  */
@@ -310,6 +317,7 @@ class MainActivity : AppCompatActivity() {
     private var playWhenPrepared = true
     private var playbackGeneration = 0L
     private val pendingQueueSongIds = LinkedHashSet<String>()
+    private val pendingQueueCacheNames = LinkedHashMap<String, String>()
     private var suppressCompletionUntil = 0L
     private val autoFullscreenRunnable = Runnable {
         val eligible = autoFullscreenSeconds > 0 && currentSong != null && playWhenPrepared && !isFullScreen
@@ -350,7 +358,28 @@ class MainActivity : AppCompatActivity() {
     private var clearDownloadsOnBoot = false
     private var autoFullscreenSeconds = 0
     private var showUsbSongs = true
+    private var storageReceiverRegistered = false
+    private val storageRefreshRunnable = Runnable {
+        if (!isFinishing && !isDestroyed && SongStorage.includeUsb) {
+            refreshLibrary {
+                when (browseMode) {
+                    "local" -> loadLocalCatalogPage()
+                    "search" -> loadBrowsePage()
+                    "quick" -> loadQuickSearchPage(activeSearchQuery)
+                    "settings_section" -> if (browseParam == "1") showSettingsSection(1, false)
+                }
+            }
+        }
+    }
+    private val storageReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) {
+            main.removeCallbacks(storageRefreshRunnable)
+            main.postDelayed(storageRefreshRunnable, 700L)
+        }
+    }
     private var autoDeleteSongs = true
+    private val cacheCleanupLock = Any()
+    @Volatile private var protectedCacheNames: Set<String> = emptySet()
     private var reserveStorageGb = 1.0
     private var floatingButtonEnabled = true
     private var songTitleSubtitleEnabled = true
@@ -361,14 +390,33 @@ class MainActivity : AppCompatActivity() {
     private var voiceEngineVolume = 70
     private var lightMode: String? = "自动"
     private var audioDelayMs = 0
-    private var screenBrightness = 80
-    private var screenMode = "适应屏幕"
+    private var screenMode = "16 : 9"
     private var doubleScreenEnabled = false
     private var tableBroadcastEnabled = true
     private var tableBroadcastSeconds = 8
     private var tableBroadcastText: String? = "欢迎光临"
 
     private class LyricLine(val timeMs: Int, val text: String?)
+
+    private var tvDisplayWidth = 0
+    private var tvDisplayHeight = 0
+
+    override fun attachBaseContext(newBase: android.content.Context) {
+        val metrics = newBase.resources.displayMetrics
+        tvDisplayWidth = metrics.widthPixels
+        tvDisplayHeight = metrics.heightPixels
+        super.attachBaseContext(TvUiScale.wrap(newBase))
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val metrics = resources.displayMetrics
+        if (TvUiScale.isTelevision(this) &&
+            (metrics.widthPixels != tvDisplayWidth || metrics.heightPixels != tvDisplayHeight)) {
+            // Manifest 保留了 screenSize 处理；分辨率改变后重新创建全部控件和弹窗上下文。
+            recreate()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -400,6 +448,9 @@ class MainActivity : AppCompatActivity() {
         runCatching {
             stateDatabase.restoreDownloads().forEach { snapshot ->
                 if (snapshot.status == "completed") return@forEach
+                // Interrupted and failed downloads require an explicit user retry.
+                orderQueue?.removeAll { stableId(it) == stableId(snapshot.song) }
+                if (currentSong?.let(::stableId) == stableId(snapshot.song)) currentSong = null
                 snapshot.localPath?.let { snapshot.song.path = it }
                 downloads += DownloadTask(snapshot.song).apply {
                     progress = snapshot.progress
@@ -421,20 +472,28 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        applyScreenBrightness()
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager?
         // 初始化 API 客户端 (歌曲下载链接)
-        init("abe235a87118f6de", "080027deed4f")
         playbackEngine = KtvPlaybackEngine(applicationContext)
+        playbackEngine.setOnDecoderRecoveryListener { recovering ->
+            if (recovering) {
+                pauseVocalIfReady()
+            } else {
+                val position = player?.currentPosition ?: 0
+                vocalPlayer?.seekTo(adjustedAudioPosition(position))
+                embeddedVocalEngine?.seekTo(adjustedAudioPosition(position + 120))
+                if (playWhenPrepared) startVocalIfReady() else pauseVocalIfReady()
+            }
+        }
+        SongOkDownloadManager.orderSnapshot = { store.orderQueue.mapNotNull { it.sourceSongNumber } }
+        SongOkDownloadManager.reclaimCache = { choice, requiredAvailable ->
+            purgeColdDownloadedFiles(choice, requiredAvailable)
+        }
         // 初始化新布局的 UI 组件
         initTvLayout()
-        val startupSong = restoredState.currentSong ?: orderQueue!!.firstOrNull()
-        startupSong?.let { restoredSong ->
-            play(restoredSong)
-            updateBottomBar(restoredSong, true)
-        }
+        // 待新目录和个人记录迁移完成后再恢复播放。
         // Keep initialization on the loading state until the external catalog is ready.
-        SongApiClient.init(this)  // 主线程初始化 JS Bridge
+        // 新歌源在工作线程请求，不依赖旧 JS Bridge。
         initializeDatabase()
         startRemoteServer()
         updateMobileQrOverlay()
@@ -448,25 +507,31 @@ class MainActivity : AppCompatActivity() {
         databaseBootstrapRunning = true
         showDatabaseLoading(true, "正在初始化曲库...", null)
         io.execute {
-            val remoteVersion = DatabaseBootstrapper.fetchRemoteVersion()
-            val localVersion = DatabaseBootstrapper.getLocalDbVersion()
-            val updateRequired = remoteVersion != null && remoteVersion != localVersion
-            var bootstrapError: Throwable? = null
-            var usedOldDatabase = false
-
-            var ok = if (updateRequired) false else library.muse.open()
-            if (!ok) {
-                library.muse.close()
-                val result = DatabaseBootstrapper.download(::showDatabaseDownloadProgress)
-                bootstrapError = result.exceptionOrNull()
-                ok = result.isSuccess && library.muse.open()
-                if (!ok) {
-                    // A failed online update must not make an existing local catalog unusable.
-                    usedOldDatabase = library.muse.open()
-                    ok = usedOldDatabase
+            val cleanup = runCatching { LegacyStorageUpgrade.clearOldDownloads(stateDatabase) }
+            if (cleanup.isFailure) {
+                main.post {
+                    databaseBootstrapRunning = false
+                    showDatabaseLoadingFailure("旧歌曲缓存清理失败：${cleanup.exceptionOrNull()?.message.orEmpty()}")
+                }
+                return@execute
+            }
+            cleanup.getOrNull()?.let { result ->
+                main.post {
+                    downloads.clear()
+                    showDatabaseLoading(true, "已清理旧歌曲缓存，正在初始化新曲库...", null)
+                    Log.i(TAG, "旧缓存已清理：${result.files} 个文件，${result.bytes} 字节")
                 }
             }
+            val installed = runCatching { CatalogAssets.install() }
+            val bootstrapError: Throwable? = installed.exceptionOrNull()
+            val ok = installed.isSuccess && library.muse.open()
 
+            if (ok) {
+                val migration = runCatching { PersonalMediaMigration.migrate(store, library.muse, currentSong) }
+                migration.onSuccess { currentSong = it }.onFailure { error ->
+                    Log.e(TAG, "个人歌曲记录迁移失败，已保留原记录", error)
+                }
+            }
             val count = if (ok) library.muse.songCount() else 0
             if (ok) warmRemoteBrowseCache(count)
             main.post {
@@ -475,7 +540,10 @@ class MainActivity : AppCompatActivity() {
                     refreshLibrary {
                         showDatabaseLoading(false, "", null)
                         showHomePage()
-                        if (usedOldDatabase && bootstrapError != null) toast("曲库更新失败，已使用本地曲库")
+                        (currentSong ?: orderQueue?.firstOrNull())?.let { restored ->
+                            if (restored.isOpenList() || !restored.remote || restored.sourceSongNumber != null || restored.hasLocalFile()) play(restored)
+                        }
+                        persistRuntimeState()
                         if (catalogRefreshPending) refreshCurrentCatalogPage()
                     }
                 } else {
@@ -486,10 +554,44 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateIgebaCatalog() {
+        if (databaseBootstrapRunning) { toast("曲库正在处理，请稍后重试"); return }
+        databaseBootstrapRunning = true
+        busy(true, "正在检查 i歌霸曲库更新…")
+        io.execute {
+            val result = runCatching {
+                val remote = IgebaCatalogBootstrapper.fetchRemoteVersion()
+                    ?: error("无法连接 i歌霸曲库，请检查网络")
+                val local = IgebaCatalogBootstrapper.getLocalDbVersion()
+                if (remote == local) false else {
+                    library.muse.close()
+                    try {
+                        IgebaCatalogBootstrapper.download(::showDatabaseDownloadProgress).getOrThrow()
+                        check(library.muse.open()) { "更新后的曲库无法打开" }
+                    } finally { if (!library.muse.isAvailable()) library.muse.open() }
+                    true
+                }
+            }
+            main.post {
+                databaseBootstrapRunning = false
+                showDatabaseLoading(false, "", null)
+                busy(false, "")
+                result.onSuccess { updated ->
+                    synchronized(browsePageCache) { browsePageCache.clear() }
+                    synchronized(browseCountCache) { browseCountCache.clear() }
+                    refreshLibrary {
+                        showSettingsSection(1, false)
+                        toast(if (updated) "曲库已更新，共 ${library.muse.songCount()} 首" else "曲库已是最新")
+                    }
+                }.onFailure { toast(it.message ?: "曲库更新失败，已保留原曲库") }
+            }
+        }
+    }
+
     private fun showDatabaseDownloadProgress(value: Int) {
         val phase = when {
-            value < 80 -> "正在下载并解压曲库"
-            value < 90 -> "正在完成解压"
+            value < 80 -> "正在同步曲库"
+            value < 90 -> "正在整理目录"
             value < 100 -> "正在校验数据库"
             else -> "完成"
         }
@@ -497,7 +599,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun warmRemoteBrowseCache(count: Int) {
-        val pageSize = MuseDatabase.PAGE_SIZE
+        val pageSize = IgebaCatalog.PAGE_SIZE
         val songs = library.muse.hotSongs(0, pageSize * 2)
         synchronized(browseCountCache) { browseCountCache["hot\u0001\u0001全部\u0001"] = count }
         songs.chunked(pageSize).forEachIndexed { page, pageSongs ->
@@ -508,14 +610,30 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (!storageReceiverRegistered) {
+            val filter = android.content.IntentFilter().apply {
+                addAction(Intent.ACTION_MEDIA_MOUNTED)
+                addAction(Intent.ACTION_MEDIA_UNMOUNTED)
+                addAction(Intent.ACTION_MEDIA_EJECT)
+                addAction(Intent.ACTION_MEDIA_REMOVED)
+                addAction(Intent.ACTION_MEDIA_BAD_REMOVAL)
+                addDataScheme("file")
+            }
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(storageReceiver, filter, RECEIVER_NOT_EXPORTED)
+            else registerReceiver(storageReceiver, filter)
+            storageReceiverRegistered = true
+        }
     }
 
-    @Deprecated("Deprecated in Android")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-    }
 
     override fun onDestroy() {
+        if (storageReceiverRegistered) {
+            runCatching { unregisterReceiver(storageReceiver) }
+            storageReceiverRegistered = false
+        }
+        main.removeCallbacks(storageRefreshRunnable)
+        main.removeCallbacks(downloadStatusTicker)
+        openListBrowser.close()
         super.onDestroy()
         io.shutdownNow()
         main.removeCallbacks(lyricTicker)
@@ -526,6 +644,8 @@ class MainActivity : AppCompatActivity() {
         releaseVocalPlayer()
         if (::playbackEngine.isInitialized) playbackEngine.release()
         remoteServer.stop()
+        SongOkDownloadManager.orderSnapshot = null
+        SongOkDownloadManager.reclaimCache = null
         library.muse.close()
         stateIo.shutdown()
         runCatching { stateIo.awaitTermination(2, TimeUnit.SECONDS) }
@@ -609,6 +729,7 @@ class MainActivity : AppCompatActivity() {
     private fun applyResponsiveLayout() {
         val config = resources.configuration
         compactUi = config.screenWidthDp < 1000 || config.screenHeightDp < 600
+        installSearchLayoutSizing()
         if (!compactUi) return
         val widthDp = config.screenWidthDp.coerceAtLeast(480)
         val barHeight = dp(52)
@@ -659,6 +780,49 @@ class MainActivity : AppCompatActivity() {
         ).forEach { id ->
             findViewById<TextView?>(id)?.apply { textSize = 15f; setPadding(dp(8), dp(8), dp(8), dp(8)) }
         }
+    }
+
+    /** Size the two search panes from their measured space, including non-TV density settings. */
+    private fun installSearchLayoutSizing() {
+        val shell = findViewById<LinearLayout>(R.id.main_layout) ?: return
+        fun resize() {
+            val availableWidth = shell.width - shell.paddingLeft - shell.paddingRight
+            val availableHeight = shell.height - shell.paddingTop - shell.paddingBottom
+            if (availableWidth <= 0 || availableHeight <= 0) return
+            val left = findViewById<LinearLayout>(R.id.left_column)
+            val leftWidth = minOf((availableWidth * 0.35f).toInt(), dp(440))
+            val gap = dp(if (compactUi) 12 else 20)
+            (left.layoutParams as LinearLayout.LayoutParams).let { lp ->
+                if (lp.width != leftWidth || lp.marginEnd != gap) {
+                    lp.width = leftWidth; lp.marginEnd = gap; left.layoutParams = lp
+                }
+            }
+            val player = findViewById<View>(R.id.player_container)
+            val videoHeight = minOf(leftWidth * 9 / 16, (availableHeight * 0.46f).toInt())
+            if (player.layoutParams.height != videoHeight) {
+                player.layoutParams = player.layoutParams.apply { height = videoHeight }
+            }
+            val grid = findViewById<LinearLayout>(R.id.keyboard_grid)
+            val modes = (grid.parent as? ViewGroup)?.getChildAt(0) as? LinearLayout
+            val modeWidth = (leftWidth * 0.23f).toInt().coerceAtMost(dp(80))
+            modes?.let { column ->
+                if (column.layoutParams.width != modeWidth) column.layoutParams =
+                    column.layoutParams.apply { width = modeWidth }
+                for (index in 0 until column.childCount) {
+                    val button = column.getChildAt(index) as? TextView ?: continue
+                    button.layoutParams = (button.layoutParams as LinearLayout.LayoutParams).apply {
+                        width = LinearLayout.LayoutParams.MATCH_PARENT
+                        marginEnd = dp(4)
+                    }
+                    androidx.core.widget.TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
+                        button, 9, 14, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+                }
+            }
+        }
+        shell.addOnLayoutChangeListener { _, l, top, r, bottom, oldL, oldTop, oldR, oldBottom ->
+            if (r - l != oldR - oldL || bottom - top != oldBottom - oldTop) resize()
+        }
+        shell.post { resize() }
     }
 
     private fun chromeBarHeight(): Int = dp(if (compactUi) 52 else 64)
@@ -1550,28 +1714,58 @@ class MainActivity : AppCompatActivity() {
         val sourceView = this@MainActivity.window.decorView.findFocus()
         val sourceFocus = captureFocusBookmark(sourceView)
         setOnShowListener {
-            listView?.apply {
+            val choices = listView?.takeIf { it.count > 0 }
+            choices?.apply {
+                descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                setItemsCanFocus(false)
+                isFocusable = true
+                isFocusableInTouchMode = true
                 setSelector(R.drawable.bg_tv_dialog_choice_focus)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    defaultFocusHighlightEnabled = false
+                onFocusChangeListener = View.OnFocusChangeListener { _, focused ->
+                    if (focused) setSelector(R.drawable.bg_tv_dialog_choice_focus)
+                    else selector = ColorDrawable(Color.TRANSPARENT)
                 }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) defaultFocusHighlightEnabled = false
             }
             window?.decorView?.let(TvFocusStyler::installTree)
-            listOf(
+            val buttons = listOf(
                 DialogInterface.BUTTON_NEGATIVE,
                 DialogInterface.BUTTON_POSITIVE,
                 DialogInterface.BUTTON_NEUTRAL,
-            ).mapNotNull(::getButton).forEach(TvFocusStyler::installAction)
-            val preferred = getButton(preferredButton)
-                ?: getButton(DialogInterface.BUTTON_NEGATIVE)
-                ?: getButton(DialogInterface.BUTTON_POSITIVE)
-            preferred?.let {
-                if (it.requestFocus() || it.requestFocusFromTouch()) {
-                    it.refreshDrawableState()
-                    it.jumpDrawablesToCurrentState()
-                    it.invalidate()
+            ).mapNotNull(::getButton).filter { it.visibility == View.VISIBLE && it.isEnabled }
+            buttons.forEach(TvFocusStyler::installAction)
+            val preferred = getButton(preferredButton)?.takeIf { it in buttons } ?: buttons.firstOrNull()
+            if (choices != null) {
+                val checked = choices.checkedItemPosition.takeIf { it >= 0 } ?: 0
+                choices.requestFocus()
+                choices.setSelection(checked)
+                setOnKeyListener { _, key, event ->
+                    val vertical = key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_DOWN
+                    val activate = key == KeyEvent.KEYCODE_DPAD_CENTER || key == KeyEvent.KEYCODE_ENTER ||
+                        key == KeyEvent.KEYCODE_NUMPAD_ENTER
+                    val listFocused = choices.hasFocus()
+                    val buttonFocused = buttons.any { it.hasFocus() }
+                    if ((!vertical && !activate) || (!listFocused && !buttonFocused) ||
+                        (activate && !listFocused)) return@setOnKeyListener false
+                    if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener true
+                    if (activate) {
+                        if (event.repeatCount == 0) {
+                            val index = choices.selectedItemPosition.coerceIn(0, choices.count - 1)
+                            val row = choices.getChildAt(index - choices.firstVisiblePosition)
+                            choices.performItemClick(row, index, choices.adapter.getItemId(index))
+                        }
+                    } else if (listFocused) {
+                        val index = choices.selectedItemPosition.coerceIn(0, choices.count - 1)
+                        val next = index + if (key == KeyEvent.KEYCODE_DPAD_DOWN) 1 else -1
+                        if (next in 0 until choices.count) choices.setSelection(next)
+                        else if (preferred != null) preferred.requestFocus()
+                    } else {
+                        choices.requestFocus()
+                        choices.setSelection(if (key == KeyEvent.KEYCODE_DPAD_UP) choices.count - 1 else 0)
+                    }
+                    true
                 }
-            }
+            } else preferred?.requestFocus()
             afterShow?.invoke()
         }
         setOnDismissListener {
@@ -1756,8 +1950,8 @@ class MainActivity : AppCompatActivity() {
                 // 网络设置
                 addSettingsTitle(content, "网络设置")
                 addSettingsItem(content, "当前网络", "WIFI 已连接", null)
-                addSettingsItem(content, "CDN 主地址", "pub.cdn.cherryonline.cn", null)
-                addSettingsItem(content, "CDN 备地址", "pub.mcdn.cherryonline.cn", null)
+                addSettingsItem(content, "CDN 主地址", "app.ige8.net", null)
+                addSettingsItem(content, "CDN 备地址", "由歌源动态返回", null)
             }
 
             7 -> {
@@ -2011,7 +2205,12 @@ class MainActivity : AppCompatActivity() {
         logo.setImageResource(R.drawable.ktv_logo)
         logo.setScaleType(ImageView.ScaleType.FIT_CENTER)
         header.addView(logo, LinearLayout.LayoutParams(dp(42), dp(42)))
-        val song = label(currentAndNextText(), 18, Color.WHITE)
+        val song = LoopingStatusTextView(this).apply {
+            text = currentAndNextText()
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
         fullScreenSongInfo = song
         header.addView(song, LinearLayout.LayoutParams(0, dp(48), 1f))
         val back = label("返回", 15, Color.WHITE)
@@ -2111,8 +2310,10 @@ class MainActivity : AppCompatActivity() {
         progressRow.setBackgroundColor(Color.argb(155, 0, 0, 0))
 
         fullScreenSeekBar = SeekBar(this).apply {
+            id = View.generateViewId()
             max = 1
             isFocusable = true
+            isFocusableInTouchMode = true
             setOnSeekBarChangeListener(object : OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
@@ -2129,13 +2330,35 @@ class MainActivity : AppCompatActivity() {
                     val position = seekBar?.progress ?: 0
                     runCatching {
                         player?.seekTo(position)
-                        prepareExternalVocal(currentSong, position)
+                        prepareExternalVocal(currentSong, position, forceSeek = true)
                     }
                     fullScreenSeeking = false
                     updateLyricView()
                     persistRuntimeState()
                 }
             })
+            // 电视遥控器：进度条获得焦点后，方向键左右直接跳转播放位置。
+            // 原生 SeekBar 在 TV 上用方向键只会移动滑块而不会真正 seekTo，需自行处理。
+            setOnKeyListener { _, keyCode, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
+                val bar = this@apply
+                when (keyCode) {
+                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        val step = max(1000, bar.max / 20)
+                        val delta = if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) step else -step
+                        val newPos = (bar.progress + delta).coerceIn(0, bar.max)
+                        bar.progress = newPos
+                        runCatching {
+                            player?.seekTo(newPos)
+                            prepareExternalVocal(currentSong, newPos, forceSeek = true)
+                        }
+                        updateLyricView()
+                        persistRuntimeState()
+                        true
+                    }
+                    else -> false
+                }
+            }
         }
         progressRow.addView(fullScreenSeekBar, LinearLayout.LayoutParams(0, dp(48), 1f))
         fullScreenTime = label("00:00 / 00:00", 14, Color.WHITE).apply {
@@ -2149,6 +2372,14 @@ class MainActivity : AppCompatActivity() {
             )
         )
         fullScreenProgressRow = progressRow
+
+        // 电视遥控器：底部控制按钮“下”键应跳到进度条，进度条“上”键返回控制按钮，
+        // 形成闭环，使遥控器焦点能从控制栏下移到底部进度条并重新返回。
+        val seekId = fullScreenSeekBar!!.id
+        controlItems.forEach { it.nextFocusDownId = seekId }
+        fullScreenSeekBar!!.nextFocusUpId =
+            controlItems.getOrNull(2)?.id ?: controlItems.first().id
+        fullScreenSeekBar!!.nextFocusDownId = fullScreenSeekBar!!.id
 
         isFullScreen = true
         fullScreenContainer!!.setVisibility(View.VISIBLE)
@@ -2303,7 +2534,6 @@ class MainActivity : AppCompatActivity() {
             indicator.alpha = 1f
             indicator.visibility = View.VISIBLE
             renderMuteButton()
-            applySystemMusicVolume()
             applyPlaybackMode()
             saveState()
             main.removeCallbacks(hideFullScreenVolumeIndicatorRunnable)
@@ -2460,7 +2690,6 @@ class MainActivity : AppCompatActivity() {
             } else {
                 musicVolume = muteBeforeVol
             }
-            applySystemMusicVolume()
             applyPlaybackMode()
             seekMusicVol.setProgress(musicVolume)
             tvMusicVol.setText(musicVolume.toString())
@@ -2496,7 +2725,6 @@ class MainActivity : AppCompatActivity() {
 
             override fun onStartTrackingTouch(s: SeekBar?) {}
             override fun onStopTrackingTouch(s: SeekBar?) {
-                applySystemMusicVolume()
                 applyPlaybackMode()
                 saveState()
             }
@@ -2509,7 +2737,6 @@ class MainActivity : AppCompatActivity() {
             seekMusicVol.setProgress(80)
             micVolume = 60
             musicVolume = 80
-            applySystemMusicVolume()
             applyPlaybackMode()
             saveState()
             tvMicVol.setText("60")
@@ -3286,6 +3513,7 @@ class MainActivity : AppCompatActivity() {
         query: Map<String, String>,
         body: String
     ): LocalRemoteServer.ApiResponse {
+        if (databaseBootstrapRunning) return remoteError(503, "LIBRARY_BUSY", "曲库正在初始化或重置，请稍后重试")
         return try {
             when {
                 method == "GET" && path == "/api/v1/state" -> remoteOk(remoteStateJson())
@@ -3306,6 +3534,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun remoteStateJson(): JSONObject {
+        if (Looper.myLooper() != main.looper) {
+            val snapshot = java.util.concurrent.FutureTask<JSONObject> { remoteStateJson() }
+            check(main.post(snapshot)) { "播放器状态暂不可用" }
+            return try { snapshot.get(3, TimeUnit.SECONDS) }
+            catch (error: Exception) { snapshot.cancel(false); throw error }
+        }
         val now = currentSong ?: orderQueue?.firstOrNull()
         val next = orderQueue?.firstOrNull { now == null || stableId(it) != stableId(now) }
         return JSONObject().apply {
@@ -3325,18 +3559,8 @@ class MainActivity : AppCompatActivity() {
         val page = (query["page"]?.toIntOrNull() ?: 1).coerceAtLeast(1)
         val pageSize = (query["pageSize"]?.toIntOrNull() ?: 20).coerceIn(1, 50)
         val offset = (page - 1) * pageSize
-        val songs = if (library.muse.isAvailable() && keyword.isNotBlank()) {
-            if (type == "singer") library.muse.searchSongsBySingerKeyword(keyword, offset, pageSize + 1)
-            else library.muse.searchSongs(keyword, offset, pageSize + 1)
-        } else {
-            library.allSongs().asSequence().filter { song ->
-                isVisibleSong(song) && keyword.isNotBlank() && if (type == "singer") {
-                    song.singer.orEmpty().contains(keyword, true)
-                } else {
-                    (song.title + " " + song.pinyin).contains(keyword, true)
-                }
-            }.drop(offset).take(pageSize + 1).toMutableList()
-        }
+        val songs = if (keyword.isBlank()) emptyList() else
+            library.search(keyword, offset, pageSize + 1, singerOnly = type == "singer", localFirst = true).songs
         val hasMore = songs.size > pageSize
         val pageSongs = songs.take(pageSize)
         val array = JSONArray()
@@ -3354,10 +3578,11 @@ class MainActivity : AppCompatActivity() {
         val pageSize = (query["pageSize"]?.toIntOrNull() ?: 10).coerceIn(1, 30)
         val offset = (page - 1) * pageSize
         val songs = if (library.muse.isAvailable()) {
-            library.muse.hotSongs(offset, pageSize + 1)
+            library.muse.hotSongs(offset, pageSize + 1, library.localCatalogNumbers())
         } else {
             library.allSongs().asSequence().filter(::isVisibleSong)
-                .sortedByDescending { it.playCount }.drop(offset).take(pageSize + 1).toMutableList()
+                .sortedByDescending { it.playCount }.sortedByDescending { it.hasLocalFile() }
+                .drop(offset).take(pageSize + 1).toMutableList()
         }
         val hasMore = songs.size > pageSize
         val array = JSONArray()
@@ -3381,6 +3606,9 @@ class MainActivity : AppCompatActivity() {
         if (id.isEmpty()) return remoteError(400, "MISSING_SONG_ID", "缺少歌曲 ID")
         val song = remoteSongCache[id] ?: library.allSongs().firstOrNull { stableId(it) == id }
             ?: return remoteError(404, "SONG_NOT_FOUND", "歌曲不存在或搜索结果已过期")
+        if (!isSongReadyForQueue(song) && !song.isOpenList() && song.sourceSongNumber != null && IgebaAccount.session == null) {
+            return remoteError(401, "IGEBA_LOGIN_REQUIRED", "请先在麦动中登录 i歌霸账号")
+        }
         if (orderQueue?.any { stableId(it) == id } == true) {
             return remoteError(409, "ALREADY_QUEUED", "歌曲已在已点列表中")
         }
@@ -3460,6 +3688,13 @@ class MainActivity : AppCompatActivity() {
         return "{\"ok\":false,\"error\":\"" + e.message.toString().replace("\"", "'") + "\"}"
     }
 
+    /** Display-only source label: local file, OpenList direct play, or online (needs download). */
+    private fun songSource(song: Song, localFile: Boolean): String = when {
+        localFile -> "local"
+        song.isOpenList() -> "nas"
+        else -> "online"
+    }
+
     @Throws(Exception::class)
     private fun songJson(song: Song): JSONObject {
         val item = JSONObject()
@@ -3469,6 +3704,11 @@ class MainActivity : AppCompatActivity() {
         item.put("category", song.category)
         item.put("language", song.language)
         item.put("remote", song.remote)
+        val localFile = song.hasLocalFile() || SongOkDownloadManager.isDownloaded(song)
+        item.put("local", localFile)
+        // Display-only: distinguish OpenList (network-drive direct play) from online songs
+        // that still need downloading. Does not change the meaning of "local".
+        item.put("source", songSource(song, localFile))
         item.put("favorite", store.isFavorite(song))
         item.put("playCount", song.playCount)
         item.put("hasOriginal", hasUrl(song.originalUrl) || hasUrl(song.originalPath))
@@ -3502,24 +3742,7 @@ class MainActivity : AppCompatActivity() {
         return "http://$host:${remoteServer.port()}/mobile"
     }
 
-    private fun localIp(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val network = interfaces.nextElement()
-                val addresses = network.getInetAddresses()
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (!address.isLoopbackAddress() && address.getHostAddress().indexOf(':') < 0 &&
-                        LocalRemoteServer.isPrivateIpv4(address.hostAddress)) {
-                        return address.getHostAddress()
-                    }
-                }
-            }
-        } catch (ignored: Exception) {
-        }
-        return "127.0.0.1"
-    }
+    private fun localIp(): String = LanAddressResolver.resolve(this).orEmpty()
 
     private fun showScoreDialog() {
         val box = LinearLayout(this)
@@ -3711,7 +3934,7 @@ class MainActivity : AppCompatActivity() {
         else if ("字数点歌" == tool) showWordCounts()
         else if ("歌星分类" == tool) showSingers()
         else if ("下载管理" == tool) showDownloads()
-        else if ("U盘加歌" == tool) showUdisk()
+        else if ("U盘加歌" == tool) chooseUsbFolder(false)
         else if ("用户影片" == tool) showLocalMovies()
         else if ("灯光迪斯科" == tool) showDisco()
         else if ("手机点歌" == tool) showMobileRemoteDialog()
@@ -3737,18 +3960,12 @@ class MainActivity : AppCompatActivity() {
         toast("广播已发送")
     }
 
-    private fun applyScreenBrightness() {
-        val attrs = getWindow().getAttributes()
-        attrs.screenBrightness = screenBrightness / 100f
-        getWindow().setAttributes(attrs)
-    }
-
     private fun removeMissingQueueItems() {
         val before = orderQueue!!.size
         for (i in orderQueue.indices.reversed()) {
             val song = orderQueue.get(i)
             val localPath = song.path
-            if (!song.remote && (localPath.isNullOrEmpty() || !File(localPath).exists())) {
+            if (!song.remote && localPath?.startsWith("content://") != true && !song.hasLocalFile()) {
                 orderQueue.removeAt(i)
             }
         }
@@ -3991,7 +4208,6 @@ class MainActivity : AppCompatActivity() {
                         if (catalog != null) copyFile(catalog, library.catalogFile())
                         store.load()
                         loadStateFromStore()
-                        applyScreenBrightness()
                         refreshLibrary(Runnable {
                             toast("恢复完成")
                             showHome()
@@ -4018,12 +4234,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemMusicVolume() {
-        if (audioManager == null) return
-        val max = audioManager!!.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        val value = max(0, min(max, (musicVolume * max) / 100))
-        audioManager!!.setStreamVolume(AudioManager.STREAM_MUSIC, value, 0)
-    }
 
     private fun clamp(value: Int, min: Int, max: Int): Int {
         return max(min, min(max, value))
@@ -4232,11 +4442,11 @@ class MainActivity : AppCompatActivity() {
         handleSong(song)
     }
 
-    val muse: MuseDatabase
+    val muse: IgebaCatalog
         /**
          * 获取 Muse 曲库数据库访问层(供 Fragment 查询歌曲/歌手/排行)。
          * 
-         * @return 全局 MuseDatabase 实例
+         * @return 全局 IgebaCatalog 实例
          */
         get() = library.muse
 
@@ -4253,6 +4463,7 @@ class MainActivity : AppCompatActivity() {
         try {
             if (player != null && currentSong != null) {
                 player!!.seekTo(max(0, positionMs))
+                prepareExternalVocal(currentSong, max(0, positionMs), forceSeek = true)
                 player!!.start()
                 startVocalIfReady()
                 updateBottomBar(currentSong, true)
@@ -4283,105 +4494,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun download(song: Song) {
-        val mainUrl = if (song.downloadUrl == null || song.downloadUrl!!.trim { it <= ' ' }
-                .isEmpty()) song.videoUrl else song.downloadUrl
-        if (mainUrl == null || mainUrl.trim { it <= ' ' }.isEmpty()) {
-            toast("该条目没有下载地址")
-            return
-        }
-        val task = DownloadTask(song)
-        downloads.add(task)
-        busy(true, "正在下载：" + song.title)
-        io.execute(Runnable {
-            val target = library.targetFor(song)
-            try {
-                downloadToFile(mainUrl, target, task, 0, 75)
-                val originalFile = sidecarFile(target, ".original", song.originalUrl)
-                val accompanyFile = sidecarFile(target, ".accompany", song.accompanyUrl)
-                val lyricFile = sidecarFile(target, "", song.lyricUrl)
-                if (hasUrl(song.originalUrl)) downloadToFile(
-                    song.originalUrl,
-                    originalFile,
-                    task,
-                    75,
-                    85
-                )
-                if (hasUrl(song.accompanyUrl)) downloadToFile(
-                    song.accompanyUrl,
-                    accompanyFile,
-                    task,
-                    85,
-                    95
-                )
-                if (hasUrl(song.lyricUrl)) downloadToFile(song.lyricUrl, lyricFile, task, 95, 99)
-                if (task.cancelled) throw InterruptedException("cancelled")
-                task.state = "完成"
-                task.progress = 100
-                val local = local(target.getAbsolutePath(), target.getName())
-                local.originalPath =
-                    if (originalFile.exists()) originalFile.getAbsolutePath() else ""
-                local.accompanyPath =
-                    if (accompanyFile.exists()) accompanyFile.getAbsolutePath() else ""
-                local.lyricPath = if (lyricFile.exists()) lyricFile.getAbsolutePath() else ""
-                main.post(Runnable {
-                    orderQueue!!.add(local)
-                    saveState()
-                    refreshLibrary(null)
-                    busy(false, "下载完成并已加入已点：" + local.title)
-                    if (currentTabIndex == 6) loadDownloadedList()
-                })
-            } catch (e: InterruptedException) {
-                task.state = "已取消"
-                target.delete()
-                cleanupSidecars(target)
-                main.post(Runnable {
-                    busy(false, "下载已取消：" + song.title)
-                    if (currentTabIndex == 6) loadDownloadedList()
-                })
-            } catch (e: Exception) {
-                task.state = "失败：" + e.message
-                main.post(Runnable {
-                    busy(false, "下载失败：" + e.message)
-                    if (currentTabIndex == 6) loadDownloadedList()
-                })
-            }
-        })
+        downloadSong(song)
     }
-
-    @Throws(Exception::class)
-    private fun downloadToFile(
-        url: String?,
-        target: File?,
-        task: DownloadTask,
-        base: Int,
-        span: Int
-    ) {
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.setConnectTimeout(10000)
-        conn.setReadTimeout(30000)
-        val code = conn.getResponseCode()
-        check(!(code < 200 || code >= 300)) { "HTTP " + code }
-        val total = conn.getContentLength()
-        var done = 0
-        task.state = "下载中"
-        try {
-            BufferedInputStream(conn.getInputStream()).use { `in` ->
-                FileOutputStream(target).use { out ->
-                    val buffer = ByteArray(64 * 1024)
-                    var read: Int
-                    while ((`in`.read(buffer).also { read = it }) > 0) {
-                        if (task.cancelled) throw InterruptedException("cancelled")
-                        out.write(buffer, 0, read)
-                        done += read
-                        if (total > 0) task.progress = min(99, base + (done * span) / total)
-                    }
-                }
-            }
-        } finally {
-            conn.disconnect()
-        }
-    }
-
     private fun hasUrl(value: String?): Boolean {
         return value != null && !value.trim { it <= ' ' }.isEmpty()
     }
@@ -4401,6 +4515,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cleanupSidecars(media: File) {
+        if (media.parentFile?.absolutePath == AppPaths.cloudSongsDir.absolutePath) {
+            listOf(".resume.json", ".complete.json").forEach { suffix ->
+                File(media.parentFile,media.name+suffix).delete()
+            }
+        }
         val dir = media.getParentFile()
         if (dir == null) return
         val path = media.getAbsolutePath()
@@ -4423,7 +4542,9 @@ class MainActivity : AppCompatActivity() {
         for (task in downloads) {
             if ("完成" != task.state) {
                 task.cancelled = true
-                task.state = "正在取消"
+                task.state = "已暂停"
+                runCatching { stateDatabase.updateDownload(task.song, "paused", task.progress) }
+                SongOkDownloadManager.cancelDownload(task.song)
             }
         }
         showDownloads()
@@ -4454,6 +4575,8 @@ class MainActivity : AppCompatActivity() {
 
             if (song.hasLocalFile()) {
                 playLocalFile(song)
+            } else if (song.isOpenList()) {
+                playOpenListSong(song)
             } else {
                 playbackPreparing = true
                 // 统一使用支持断点续传和下载地址重试的下载管理器。
@@ -4470,6 +4593,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun playOpenListSong(song: Song, startPositionMs: Int = 0) {
+        val generation = playbackGeneration
+        val config = openListBrowser.config()
+        playbackPreparing = true
+        player?.stopPlayback()
+        io.execute {
+            val result = runCatching {
+                check(config.server == song.openListServer && config.server.isNotBlank()) {
+                    "请重新连接此歌曲所属的 OpenList 服务"
+                }
+                val path = song.openListPath ?: error("网盘歌曲路径缺失")
+                check(OpenListPaths.within(path, config.root)) { "歌曲不在设置的目录范围内" }
+                OpenListClient(config).resolve(path)
+            }
+            main.post {
+                if (isFinishing || isDestroyed || generation != playbackGeneration || currentSong !== song) return@post
+                result.onSuccess { url ->
+                    setupPlayerListeners(song, startPositionMs, generation)
+                    player!!.setVideoURI(Uri.parse(url))
+                    if (playWhenPrepared) player!!.start()
+                }.onFailure {
+                    playbackPreparing = false
+                    toast("网盘歌曲加载失败，已跳过；请检查连接、令牌和目录权限")
+                    playNext()
+                }
+            }
+        }
+    }
+
     private fun playLocalFile(song: Song, startPositionMs: Int = 0) {
         try {
             playbackPreparing = true
@@ -4479,26 +4631,23 @@ class MainActivity : AppCompatActivity() {
                 startDownloadAndPlay(song)
                 return
             }
-            val f = File(localPath)
-            val inspection = SongFileValidator.inspect(f, SongFileValidator.requiresTransportStream(f))
-            if (!inspection.valid) {
-                Log.w(TAG, "Invalid local file: ${song.path}, ${inspection.reason}")
-                if (f.exists()) runCatching { f.delete() }
+            val media = SongStorage.fromPath(localPath)
+            if (!SongStorage.valid(media)) {
+                playbackPreparing = false
+                if (!song.remote || song.sourceSongNumber.isNullOrBlank()) {
+                    toast("本地歌曲不可读，请检查文件、U盘连接及目录授权")
+                    return
+                }
                 song.path = null
-                toast("本地文件丢失，重新下载...")
+                toast("本地文件不可用，重新下载...")
                 startDownloadAndPlay(song)
                 return
             }
-            Log.i(
-                TAG,
-                "playLocalFile song=${stableId(song)} generation=$playbackGeneration " +
-                    "startPositionMs=$startPositionMs path=${f.absolutePath} size=${f.length()}",
-            )
-            // 自动清理以文件时间作为最近使用时间；每次实际播放都刷新，避免常唱歌曲被误删。
-            runCatching { f.setLastModified(System.currentTimeMillis()) }
+            Log.i(TAG, "playLocalFile song=${stableId(song)} generation=$playbackGeneration startPositionMs=$startPositionMs path=$localPath")
+            if (media is SongStorage.FileMedia) runCatching { media.file.setLastModified(System.currentTimeMillis()) }
             player!!.stopPlayback()
             setupPlayerListeners(song, startPositionMs, playbackGeneration)
-            player!!.setVideoURI(Uri.fromFile(f))
+            player!!.setVideoURI(if (localPath.startsWith("content://")) Uri.parse(localPath) else Uri.fromFile(File(localPath)))
             if (playWhenPrepared) player!!.start()
         } catch (e: Exception) {
             playbackPreparing = false
@@ -4512,90 +4661,8 @@ class MainActivity : AppCompatActivity() {
      * 使用256KB大缓冲区加速下载，实时显示进度。
      */
     private fun streamDownloadAndPlay(song: Song) {
-        io.execute(Runnable {
-            var tmpFile: File? = null
-            try {
-                var url = song.downloadUrl
-                if (url == null || url.isEmpty()) {
-                    url = getSongDownloadUrl(extractTid(song))
-                    if (url != null) song.downloadUrl = url
-                }
-                if (url == null || url.isEmpty()) {
-                    main.post(Runnable {
-                        hideDownloadProgress()
-                        toast("无法获取播放地址")
-                    })
-                    return@Runnable
-                }
-
-                val finalFile = getLocalFile(song)
-                finalFile.getParentFile().mkdirs()
-                tmpFile = File(finalFile.getParent(), finalFile.getName() + ".tmp")
-
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.setConnectTimeout(10000)
-                conn.setReadTimeout(30000)
-                conn.setRequestProperty("User-Agent", "ThunderSDK/4.1.3")
-                conn.connect()
-
-                val totalSize = conn.getContentLength().toLong()
-                val `in`: InputStream = BufferedInputStream(conn.getInputStream(), 262144)
-                val out = FileOutputStream(tmpFile)
-
-                val buf = ByteArray(262144) // 256KB buffer for speed
-                var downloaded: kotlin.Long = 0
-                var lastPct = 0
-                var lastTime = System.currentTimeMillis()
-                var lastBytes: kotlin.Long = 0
-
-                while (true) {
-                    val read = `in`.read(buf)
-                    if (read < 0) break
-                    out.write(buf, 0, read)
-                    downloaded += read.toLong()
-
-                    // 每秒更新一次进度和速度
-                    val now = System.currentTimeMillis()
-                    if (now - lastTime > 1000) {
-                        val pct = if (totalSize > 0) (downloaded * 100 / totalSize).toInt() else 0
-                        val speed = downloaded - lastBytes
-                        lastPct = pct
-                        lastTime = now
-                        lastBytes = downloaded
-                        val p = pct
-                        val speedStr = formatSize(speed) + "/s"
-                        main.post(Runnable {
-                            updateDownloadProgress(song, p)
-                            if (textDownloadSpeed != null) textDownloadSpeed!!.setText(speedStr)
-                        })
-                    }
-                }
-                out.close()
-                `in`.close()
-                conn.disconnect()
-
-                // 移到正式位置
-                tmpFile.renameTo(finalFile)
-                song.path = finalFile.getAbsolutePath()
-
-                main.post(Runnable {
-                    hideDownloadProgress()
-                    if (currentSong != null && currentSong!!.equals(song)) {
-                        playLocalFile(song)
-                    }
-                    toast(song.title + " 就绪")
-                })
-            } catch (e: Exception) {
-                Log.e(TAG, "download error: " + e.message)
-                if (tmpFile != null) tmpFile.delete()
-                main.post(Runnable {
-                    hideDownloadProgress()
-                    toast("下载失败: " + e.message)
-                })
-            }
-        })
+        startDownloadAndPlay(song)
     }
-
     /**
      * 下载歌曲并在完成后自动播放 (旧版，备用)。
      */
@@ -4651,7 +4718,7 @@ class MainActivity : AppCompatActivity() {
             currentMediaPlayer = mp
             applyPlaybackMode()
             if (startPositionMs > 0) player!!.seekTo(startPositionMs)
-            prepareExternalVocal(song, startPositionMs)
+            prepareExternalVocal(song, startPositionMs, forceSeek = true)
             if (playWhenPrepared) {
                 player!!.start()
                 startVocalIfReady()
@@ -4670,15 +4737,19 @@ class MainActivity : AppCompatActivity() {
             if (generation != playbackGeneration || currentSong?.equals(song) != true) return@OnErrorListener true
             playbackPreparing = false
             Log.e(TAG, "MediaPlayer error what=" + what + " extra=" + extra)
-            if (songRetryCount < 2 && song != null && song.hasLocalFile()) {
+            if (!DecoderRecoveryState.isDecoderFailure(extra) && songRetryCount < 2 &&
+                song != null && (song.isOpenList() || song.hasLocalFile())) {
                 songRetryCount++
                 val retry = songRetryCount
                 main.postDelayed(Runnable {
+                    if (generation != playbackGeneration || currentSong !== song) return@Runnable
                     toast("播放重试 " + retry + "/2")
-                    playLocalFile(song)
+                    if (song.isOpenList()) playOpenListSong(song, player?.currentPosition ?: 0)
+                    else playLocalFile(song)
                 }, 700L * retry)
             } else {
                 songRetryCount = 0
+                if (DecoderRecoveryState.isDecoderFailure(extra)) toast("当前歌曲解码失败，正在播放下一首")
                 main.post(Runnable { this.playNext() })
             }
             true
@@ -4724,56 +4795,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 从 CDN 下载歌曲文件。
-     * 使用 global_confs 表中的 cdn_path 作为基础 URL。
-     * 
-     * @param song 要下载的歌曲
-     */
-    private fun downloadFromCdn(song: Song) {
-        if (song.filename == null || song.filename!!.isEmpty()) {
-            toast("无法下载:缺少文件名")
-            return
-        }
-        val cdnBase = "https://pub.mcdn.cherryonline.cn/"
-        val url = cdnBase + "cloud-song/" + song.filename
-        val task = DownloadTask(song)
-        downloads.add(task)
-        busy(true, "正在从云端下载:" + song.title)
-        io.execute(Runnable {
-            val target =
-                File(MuseDatabase.VIDEO_ROOT + "/" + MuseDatabase.CLOUD_SONG_DIR, song.filename)
-            try {
-                File(target.getParent()).mkdirs()
-                downloadToFile(url, target, task, 0, 100)
-                task.state = "完成"
-                task.progress = 100
-                song.path = target.getAbsolutePath()
-                main.post(Runnable {
-                    busy(false, "下载完成")
-                    if (currentTabIndex == 6) loadDownloadedList()
-                    if (currentSong?.equals(song) == true && playbackPreparing) {
-                        switchToLocalPlayback(song)
-                    }
-                })
-            } catch (e: Exception) {
-                task.state = "失败:" + e.message
-                main.post(Runnable {
-                    busy(false, "下载失败:" + e.message)
-                    if (currentTabIndex == 6) loadDownloadedList()
-                })
-            }
-        })
-    }
-
-    /**
      * 使用 SongOkDownloadManager 下载歌曲到本地。
      */
     private fun downloadSong(song: Song, extraCallback: DownloadCallback? = null, storageChecked: Boolean = false) {
+        if (!song.isOpenList() && song.sourceSongNumber != null && IgebaAccount.session == null) {
+            toast("请先登录 i歌霸账号")
+            IgebaAccountDialog.show(this) { refreshSongAdapter() }
+            extraCallback?.onDownloadFailed(song, "请先登录 i歌霸账号")
+            return
+        }
+        main.removeCallbacks(downloadStatusTicker)
+        main.post(downloadStatusTicker)
+        val openList = openListBrowser.config()
+        if (store.downloadToOpenList && openList.server.isBlank()) {
+            toast("请先设置 OpenList 连接和歌曲目录")
+            openListBrowser.show()
+            return
+        }
         if (SongOkDownloadManager.isDownloading(song)) {
             if (extraCallback != null) extraCallback.onDownloadStart(song)
             return
         }
-        if (!storageChecked && autoDeleteSongs && isBelowReservedStorage()) {
+        if (!store.downloadToOpenList && !storageChecked && autoDeleteSongs && isBelowReservedStorage()) {
             io.execute {
                 purgeColdDownloadedFiles()
                 main.post { downloadSong(song, extraCallback, storageChecked = true) }
@@ -4783,6 +4826,9 @@ class MainActivity : AppCompatActivity() {
         if (::stateDatabase.isInitialized) runCatching {
             stateIo.execute { stateDatabase.updateDownload(song, "queued", 0) }
         }
+        downloads.removeAll { stableId(it.song) == stableId(song) }
+        downloads.add(DownloadTask(song).apply { state = "等待" })
+        refreshSongAdapter()
         download(song, object : DownloadCallback {
             override fun onDownloadStart(song: Song) {
                 if (extraCallback != null) extraCallback.onDownloadStart(song)
@@ -4800,10 +4846,13 @@ class MainActivity : AppCompatActivity() {
                 })
             }
 
+            private var lastProgressSave = 0L
             override fun onDownloadProgress(song: Song, progress: Int) {
                 if (extraCallback != null) extraCallback.onDownloadProgress(song, progress)
-                if (::stateDatabase.isInitialized) runCatching {
-                    stateDatabase.updateDownload(song, "downloading", progress)
+                val now = System.nanoTime()
+                if (::stateDatabase.isInitialized && now - lastProgressSave >= 1_000_000_000L) {
+                    lastProgressSave = now
+                    runCatching { stateDatabase.updateDownload(song, "downloading", progress) }
                 }
                 main.post(Runnable {
                     for (task in downloads) {
@@ -4812,7 +4861,7 @@ class MainActivity : AppCompatActivity() {
                             break
                         }
                     }
-                    if (currentTabIndex == 6) loadDownloadedList()
+                    if (currentTabIndex == 6) renderSongList()
                     if (currentSong?.equals(song) == true && playbackPreparing) updateDownloadProgress(song, progress)
                 })
             }
@@ -4829,22 +4878,39 @@ class MainActivity : AppCompatActivity() {
                 }
                 main.post(Runnable {
                     downloads.removeAll { stableId(it.song) == stableId(song) }
-                    song.path = localPath
+                    song.path = localPath.takeIf { it.isNotBlank() }
+                    io.execute {
+                        if (song.isOpenList() && song.openListServer == openList.server) {
+                            runCatching { library.rememberOpenList(openList, song) }
+                                .onFailure { Log.w(TAG, "网盘歌曲索引保存失败", it) }
+                        }
+                        library.scanLocal()
+                        main.post {
+                            synchronized(browsePageCache) { browsePageCache.clear() }
+                            synchronized(browseCountCache) { browseCountCache.clear() }
+                            if (browseMode == "local") reloadCurrentBrowsePage()
+                            else refreshSongAdapter()
+                        }
+                    }
+                    toast(if (song.isOpenList() && localPath.isBlank()) "歌曲已保存到网盘" else "歌曲保存完成")
                     refreshSongAdapter()
                     val shouldAddToQueue = pendingQueueSongIds.remove(stableId(song))
+                    pendingQueueCacheNames.remove(stableId(song))
                     Log.i(
                         TAG,
                         "downloadComplete song=${stableId(song)} pendingQueue=$shouldAddToQueue " +
                             "current=${currentSong?.let(::stableId)} preparing=$playbackPreparing path=$localPath",
                     )
                     if (shouldAddToQueue) addReadySongToQueue(song)
+                    else persistRuntimeState()
                     if (currentTabIndex == 6) loadDownloadedList()
                     if (currentSong?.equals(song) == true && playbackPreparing) hideDownloadProgress()
                     if (!shouldAddToQueue && currentSong?.equals(song) == true && playbackPreparing) {
-                        switchToLocalPlayback(song)
+                        if (song.isOpenList() && !song.hasLocalFile()) playOpenListSong(song)
+                        else switchToLocalPlayback(song)
                     }
                 })
-                enforceStorageReserve()
+                if (!store.downloadToOpenList) enforceStorageReserve()
             }
 
             override fun onDownloadFailed(song: Song, error: String) {
@@ -4854,20 +4920,32 @@ class MainActivity : AppCompatActivity() {
                 }
                 main.post(Runnable {
                     val wasPendingQueue = pendingQueueSongIds.remove(stableId(song))
-                    if (currentSong != null && currentSong!!.equals(song)) playbackPreparing = false
-                    for (task in downloads) {
-                        if (task.song === song || task.song.id != null && task.song.id == song.id) {
-                            task.state = "失败:" + error
-                            break
-                        }
+                    pendingQueueCacheNames.remove(stableId(song))
+                    persistRuntimeState()
+                    val failedCurrent = playbackPreparing && currentSong?.let(::stableId) == stableId(song)
+                    if (failedCurrent || wasPendingQueue) orderQueue?.removeAll { stableId(it) == stableId(song) }
+                    if (failedCurrent) {
+                        playbackPreparing = false
+                        currentSong = null
+                        orderQueue?.firstOrNull()?.let { play(it) }
+                    }
+                    persistRuntimeState()
+                    syncPlayerInfo()
+                    downloads.firstOrNull { stableId(it.song) == stableId(song) }?.let { task ->
+                        task.state = "失败:" + error
+                        downloads.remove(task)
+                        downloads.add(task)
                     }
                     refreshSongAdapter()
                     if (currentTabIndex == 6) loadDownloadedList()
                     if (currentSong?.equals(song) == true) hideDownloadProgress()
-                    if (wasPendingQueue) toast("下载失败，未加入已点：${song.title}")
+                    Log.w(TAG, "downloadFailed song=${stableId(song)} error=$error")
+                    syncPlayerInfo()
+                    if (wasPendingQueue) toast("下载失败：$error；已跳过，可在下载列表重试或删除：${song.title}")
                 })
             }
-        })
+        }, source = openList, cloud = openList.takeIf { store.downloadToOpenList },
+            copyExisting = extraCallback == null)
     }
 
     /**
@@ -4879,23 +4957,6 @@ class MainActivity : AppCompatActivity() {
      * @param song 要检查的歌曲
      * @return true 表示正在下载
      */
-    /** 从 Song 中提取云端歌曲 TID (filename 格式: "7678785.ts" / "7586669.ls" → "7678785" / "7586669")  */
-    private fun extractTid(song: Song): String? {
-        if (song.filename != null) {
-            // 去掉 .ts 或 .ls 扩展名
-            if (song.filename!!.endsWith(".ts")) return song.filename!!.substring(
-                0,
-                song.filename!!.length - 3
-            )
-            if (song.filename!!.endsWith(".ls")) return song.filename!!.substring(
-                0,
-                song.filename!!.length - 3
-            )
-            return song.filename
-        }
-        return song.id
-    }
-
     private fun isDownloading(song: Song): Boolean {
         if (SongOkDownloadManager.isDownloading(song)) {
             return true
@@ -4914,7 +4975,7 @@ class MainActivity : AppCompatActivity() {
         if (fromCompletion && loopOne && player != null && currentSong != null) {
             playWhenPrepared = true
             player!!.seekTo(0)
-            prepareExternalVocal(currentSong, 0)
+            prepareExternalVocal(currentSong, 0, forceSeek = true)
             player!!.start()
             startVocalIfReady()
             return
@@ -4976,15 +5037,8 @@ class MainActivity : AppCompatActivity() {
 
         io.execute {
             val localSongs = localSongInventory()
-            library.scanLocal().forEach { song ->
-                val file = song.path?.let(::File) ?: return@forEach
-                if (SongFileValidator.inspect(
-                        file,
-                        SongFileValidator.requiresTransportStream(file),
-                    ).valid
-                ) {
-                    localSongs.putIfAbsent(stableId(song), song)
-                }
+            library.scanLocal().filter { it.hasLocalFile() }.forEach { song ->
+                localSongs.putIfAbsent(stableId(song), song)
             }
             val allLocalSongs = localSongs.values.toList()
             val alternatives = allLocalSongs.filter { stableId(it) != previousSongId }
@@ -5041,7 +5095,7 @@ class MainActivity : AppCompatActivity() {
         suppressCompletionUntil = System.currentTimeMillis() + 1500L
         player!!.seekTo(0)
         updateLyricView()
-        prepareExternalVocal(currentSong, 0)
+        prepareExternalVocal(currentSong, 0, forceSeek = true)
         player!!.start()
         startVocalIfReady()
         hidePlaybackNoticeNow()
@@ -5053,6 +5107,8 @@ class MainActivity : AppCompatActivity() {
     private fun applyPlaybackMode() {
         val videoPlayer = player ?: return
         videoPlayer.setTone(tone)
+        vocalPlayer?.setTone(tone)
+        embeddedVocalEngine?.setTone(tone)
         val external = prepareExternalVocal(
             currentSong,
             player?.currentPosition ?: 0
@@ -5077,17 +5133,20 @@ class MainActivity : AppCompatActivity() {
             when {
                 external || "静音练唱" == singMode -> videoPlayer.setPlaybackVolume(0f, 0f)
                 embedded -> videoPlayer.setPlaybackVolume(volume, volume)
-                trackSelected -> videoPlayer.selectAudioChannel(IjkMediaPlayer.AUDIO_CHANNEL_STEREO, volume)
+                trackSelected -> videoPlayer.selectAudioChannel(AudioChannels.AUDIO_CHANNEL_STEREO, volume)
                 "自动" != vocalChannelMode -> {
                     videoPlayer.selectAudioChannel(selectedChannelForMode(), volume)
                     status?.text = "声道模式：$vocalChannelMode / ${if (originalVocal) "原唱" else "伴唱"}"
                 }
                 channelApplied -> Unit
-                else -> videoPlayer.selectAudioChannel(IjkMediaPlayer.AUDIO_CHANNEL_STEREO, volume)
+                else -> videoPlayer.selectAudioChannel(AudioChannels.AUDIO_CHANNEL_STEREO, volume)
             }
         } catch (ignored: Exception) {
         }
         applyVocalVolume()
+        Log.i(TAG, "Playback volume music=$musicVolume pcm=${musicVolume / 100f} " +
+            "system=${audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC)}/" +
+            "${audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC)}")
         if (embedded && vocalPlayerPrepared) {
             val mainPosition = videoPlayer.currentPosition
             val alternatePosition = embeddedVocalEngine?.currentPosition ?: mainPosition
@@ -5118,9 +5177,9 @@ class MainActivity : AppCompatActivity() {
         try {
             val volume = max(0f, min(1f, musicVolume / 100f))
             val channel = if (currentSong!!.accomp == 1) {
-                if (originalVocal) IjkMediaPlayer.AUDIO_CHANNEL_RIGHT else IjkMediaPlayer.AUDIO_CHANNEL_LEFT
+                if (originalVocal) AudioChannels.AUDIO_CHANNEL_RIGHT else AudioChannels.AUDIO_CHANNEL_LEFT
             } else {
-                if (originalVocal) IjkMediaPlayer.AUDIO_CHANNEL_LEFT else IjkMediaPlayer.AUDIO_CHANNEL_RIGHT
+                if (originalVocal) AudioChannels.AUDIO_CHANNEL_LEFT else AudioChannels.AUDIO_CHANNEL_RIGHT
             }
             videoPlayer.selectAudioChannel(channel, volume)
             status!!.setText((if (originalVocal) "原唱" else "伴唱") + "(声道" + currentSong!!.accomp + ")")
@@ -5137,9 +5196,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectedChannelForMode(): Int = when (vocalChannelMode) {
-        "左伴右原" -> if (originalVocal) IjkMediaPlayer.AUDIO_CHANNEL_RIGHT else IjkMediaPlayer.AUDIO_CHANNEL_LEFT
-        "右伴左原" -> if (originalVocal) IjkMediaPlayer.AUDIO_CHANNEL_LEFT else IjkMediaPlayer.AUDIO_CHANNEL_RIGHT
-        else -> IjkMediaPlayer.AUDIO_CHANNEL_STEREO
+        "左伴右原" -> if (originalVocal) AudioChannels.AUDIO_CHANNEL_RIGHT else AudioChannels.AUDIO_CHANNEL_LEFT
+        "右伴左原" -> if (originalVocal) AudioChannels.AUDIO_CHANNEL_LEFT else AudioChannels.AUDIO_CHANNEL_RIGHT
+        else -> AudioChannels.AUDIO_CHANNEL_STEREO
     }
 
     private fun channelVolumes(volume: Float): FloatArray {
@@ -5152,14 +5211,15 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(volume, volume)
     }
 
-    private fun prepareExternalVocal(song: Song?, positionMs: Int): Boolean {
+    private fun prepareExternalVocal(song: Song?, positionMs: Int, forceSeek: Boolean = false): Boolean {
         val path = selectedVocalPath(song)
         if (!hasUrl(path)) {
             if (embeddedDualTrackMode && embeddedVocalEngine != null) {
                 pendingVocalPosition = adjustedAudioPosition(positionMs)
                 if (vocalPlayerPrepared) runCatching {
                     val drift = kotlin.math.abs(embeddedVocalEngine!!.currentPosition - pendingVocalPosition)
-                    if (drift > 300 && originalVocal == embeddedMainTrackOriginal) {
+                    // User seeks must move both decoders, including the currently audible one.
+                    if (forceSeek || drift > 300 && originalVocal == embeddedMainTrackOriginal) {
                         embeddedVocalEngine!!.seekTo(pendingVocalPosition)
                     }
                 }
@@ -5182,29 +5242,40 @@ class MainActivity : AppCompatActivity() {
         releaseVocalPlayer()
         try {
             embeddedDualTrackMode = false
-            val candidate = MediaPlayer()
+            val candidate = KtvPlaybackEngine(this, audioOnly = true)
             vocalPlayer = candidate
             vocalPlayerPrepared = false
             pendingVocalPosition = adjustedAudioPosition(positionMs)
             currentVocalPath = path
-            candidate.setDataSource(path)
-            candidate.setAudioStreamType(AudioManager.STREAM_MUSIC)
-            candidate.setOnCompletionListener(OnCompletionListener { _: MediaPlayer? -> })
-            candidate.setOnPreparedListener { preparedPlayer ->
-                if (vocalPlayer !== preparedPlayer || currentVocalPath != path) {
-                    runCatching { preparedPlayer.release() }
+            candidate.setVolume(0f, 0f)
+            candidate.setTone(tone)
+            candidate.setOnCompletionListener(null)
+            candidate.setOnPreparedListener {
+                if (vocalPlayer !== candidate || currentVocalPath != path) {
+                    candidate.release()
                     return@setOnPreparedListener
                 }
                 vocalPlayerPrepared = true
-                if (pendingVocalPosition > 0) runCatching { preparedPlayer.seekTo(pendingVocalPosition) }
+                val position = adjustedAudioPosition(player?.currentPosition ?: positionMs)
+                if (position > 0) candidate.seekTo(position)
                 applyVocalVolume()
                 if (playWhenPrepared) startVocalIfReady() else pauseVocalIfReady()
             }
-            candidate.setOnErrorListener { failedPlayer, _, _ ->
-                if (vocalPlayer === failedPlayer) releaseVocalPlayer()
+            candidate.setOnErrorListener { _, _, _ ->
+                if (vocalPlayer === candidate) {
+                    releaseVocalPlayer()
+                    player?.setPlaybackVolume(musicVolume / 100f, musicVolume / 100f)
+                    toast("外置原伴唱播放失败，已恢复主音轨")
+                }
                 true
             }
-            candidate.prepareAsync()
+            candidate.setVideoUri(
+                when {
+                    path.startsWith("content://") || path.startsWith("http://") || path.startsWith("https://") ->
+                        Uri.parse(path)
+                    else -> Uri.fromFile(File(path))
+                },
+            )
             return true
         } catch (e: Exception) {
             releaseVocalPlayer()
@@ -5215,12 +5286,12 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 双音轨 TS 使用一个常驻的静音副播放器预解码另一条音轨。切换时只交叉调整两个
-     * 播放器的音量，不再对主 IJKPlayer 调用 selectTrack，避免 AudioTrack 被销毁重建。
+     * 播放器音量，减少原伴唱切换时的音频输出重建。
      */
     private fun prepareEmbeddedDualTrackVocal(song: Song?, positionMs: Int): Boolean {
         val videoPlayer = player ?: return false
         val path = song?.path?.takeIf { it.isNotBlank() } ?: return false
-        if (videoPlayer.audioTrackCount() < 2 || !File(path).isFile) {
+        if (videoPlayer.audioTrackCount() < 2 || song?.hasLocalFile() != true) {
             if (embeddedDualTrackMode) releaseVocalPlayer()
             return false
         }
@@ -5239,10 +5310,11 @@ class MainActivity : AppCompatActivity() {
             embeddedMainTrackOriginal = originalVocal
             pendingVocalPosition = adjustedAudioPosition(positionMs)
             currentVocalPath = path
-            val candidate = KtvPlaybackEngine(this)
+            val candidate = KtvPlaybackEngine(this, audioOnly = true)
             embeddedVocalEngine = candidate
             vocalPlayerPrepared = false
             candidate.setVolume(0f, 0f)
+            candidate.setTone(tone)
             candidate.setOnCompletionListener(null)
             candidate.setOnPreparedListener {
                 if (embeddedVocalEngine !== candidate || currentVocalPath != path || !embeddedDualTrackMode) {
@@ -5280,7 +5352,7 @@ class MainActivity : AppCompatActivity() {
                 if (embeddedVocalEngine === candidate) releaseVocalPlayer()
                 true
             }
-            candidate.setVideoUri(Uri.fromFile(File(path)))
+            candidate.setVideoUri(if (path.startsWith("content://")) Uri.parse(path) else Uri.fromFile(File(path)))
             false
         } catch (e: Exception) {
             Log.w(TAG, "Embedded seamless vocal prepare failed path=$path", e)
@@ -5470,7 +5542,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showSongActions(song: Song) {
-        val hasLocalFile = hasValidLocalSongFile(song)
+        val hasLocalFile = song.hasLocalFile() || SongOkDownloadManager.isDownloaded(song)
         val isFavorite = store.isFavorite(song)
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5521,13 +5593,21 @@ class MainActivity : AppCompatActivity() {
             saveState()
             toast(if (added) "已收藏" else "已取消收藏")
             if (browseMode == "favorites") {
-                visibleSongs.removeAll { stableId(it) == stableId(song) }
+                favoriteSongs.removeAll { stableId(it) == stableId(song) }
                 renderSongList()
             }
         }, LinearLayout.LayoutParams(0, -2, 1f))
+        actions.addView(action(R.drawable.ott_ic_download, "保存到") {
+            showSaveSongDialog(song)
+        }, LinearLayout.LayoutParams(0, -2, 1f))
         if (hasLocalFile) {
-            actions.addView(action(R.drawable.ott_ic_delete, "删除文件") {
+            actions.addView(action(R.drawable.ott_ic_delete, "删除本地文件") {
                 confirmDeleteLocalFile(song)
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        if (song.isOpenList()) {
+            actions.addView(action(R.drawable.ott_ic_delete, "删除远端文件") {
+                confirmDeleteOpenListFile(song)
             }, LinearLayout.LayoutParams(0, -2, 1f))
         }
         panel.addView(actions, LinearLayout.LayoutParams(-1, -2))
@@ -5561,6 +5641,62 @@ class MainActivity : AppCompatActivity() {
             .setMessage("确定删除 ${song.title} 的本地文件吗？歌曲仍保留在曲库中。")
             .setNegativeButton("取消", null)
             .setPositiveButton("确定") { _, _ -> deleteDownloadedSong(song) }
+            .create().showForTv()
+    }
+
+    private fun confirmDeleteOpenListFile(song: Song) {
+        val config = openListBrowser.config()
+        val path = song.openListPath ?: return
+        if (config.server.isBlank() || config.server != song.openListServer) {
+            toast("请先连接此歌曲所属的 OpenList 服务")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("删除远端文件")
+            .setMessage("确定删除《${song.title}》的 OpenList/NAS 原文件吗？\n位置：$path\n本地副本不会删除，其他设备也将无法访问这个远端文件。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("删除") { _, _ ->
+                if (currentSong?.let { it.openListServer == config.server && it.openListPath == path } == true) {
+                    toast("正在播放的歌曲不能删除")
+                    return@setPositiveButton
+                }
+                busy(true, "正在删除远端文件...")
+                io.execute {
+                    val result = runCatching { OpenListClient(config).remove(path) }
+                    val indexUpdated = result.isSuccess && runCatching {
+                        library.forgetOpenList(config, path)
+                    }.isSuccess
+                    main.post {
+                        busy(false, "")
+                        result.onSuccess {
+                            // 只清除这个远端位置的引用，保留本地副本及在线曲库入口。
+                            val matches: (Song) -> Boolean = {
+                                it.openListServer == config.server && it.openListPath == path
+                            }
+                            orderQueue?.removeAll { matches(it) && !it.hasLocalFile() }
+                            sangHistory.removeAll { matches(it) && !it.hasLocalFile() }
+                            val removedDownloads = downloads.filter { matches(it.song) && !it.song.hasLocalFile() }
+                            downloads.removeAll(removedDownloads.toSet())
+                            stateIo.execute {
+                                removedDownloads.forEach { stateDatabase.removeDownload(it.song) }
+                            }
+                            if (song.id?.startsWith("openlist:") == true && !song.hasLocalFile()) {
+                                store.favoriteIds.remove(stableId(song))
+                                store.playlistSongs.values.forEach { it.remove(stableId(song)) }
+                            }
+                            saveState()
+                            refreshLibrary {
+                                reloadCurrentBrowsePage()
+                                renderQueue()
+                                toast(if (indexUpdated) "远端文件已删除"
+                                    else "远端文件已删除，索引更新失败，请重新扫描网盘")
+                            }
+                        }.onFailure {
+                            toast(it.message ?: "远端删除失败，请检查连接和删除权限")
+                        }
+                    }
+                }
+            }
             .create().showForTv()
     }
 
@@ -5673,19 +5809,30 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun refreshLibrary(after: Runnable?) {
-        busy(true, "正在扫描曲库...")
-        io.execute(Runnable {
-            val locals = library.scanLocal().size
-            library.loadCachedRemote()
-            main.post(Runnable {
-                busy(
-                    false,
-                    "曲库已更新：本地 " + locals + " 首，总计 " + library.allSongs().size + " 首"
-                )
-                if (after != null) after.run()
-            })
-        })
+    private fun refreshLibrary(after: Runnable?) = refreshLibraryImpl(after, false)
+
+    private fun refreshLibraryImpl(after: Runnable?, scanOpenList: Boolean) {
+        busy(true, if (scanOpenList) "正在扫描网盘歌曲..." else "正在扫描曲库...")
+        io.execute {
+            val result = runCatching {
+                val locals = library.scanLocal().size
+                library.loadCachedRemote()
+                if (scanOpenList) library.syncOpenList(openListBrowser.config())
+                else library.loadCachedOpenList(openListBrowser.config())
+                locals
+            }
+            main.post {
+                result.onSuccess { locals ->
+                    busy(false, "曲库已更新：本地 $locals 首，总计 ${library.allSongs().size} 首")
+                    after?.run()
+                    SongStorage.usbScanError?.let(::toast)
+                    library.openListScanError?.let(::toast)
+                }.onFailure {
+                    busy(false, "曲库扫描失败")
+                    toast(it.message ?: "曲库扫描失败，请检查保存位置")
+                }
+            }
+        }
     }
 
     private fun showCatalogDialog() {
@@ -6554,7 +6701,7 @@ class MainActivity : AppCompatActivity() {
         if (keyboardArea != null) keyboardArea!!.setVisibility(View.VISIBLE)
         rankCategoryGrid?.visibility = View.GONE
         if (tabContainer != null) tabContainer!!.setVisibility(View.VISIBLE)
-        if (paginationBar != null) paginationBar!!.setVisibility(View.GONE)
+        paginationBar?.visibility = View.VISIBLE
         browsePagination?.visibility = View.VISIBLE
         if (songList != null) {
             songList!!.setBackgroundResource(R.drawable.bg_song_list)
@@ -6746,27 +6893,32 @@ class MainActivity : AppCompatActivity() {
     private fun syncPlayerInfo() {
         val title = if (currentSong == null) "未播放" else currentSong!!.title
         val singer = if (currentSong == null) "" else currentSong!!.singer
-        if (homePlayerTitle != null) homePlayerTitle!!.text = currentAndNextText()
-        if (homePlayerSinger != null) homePlayerSinger!!.setText(singer)
-        if (playerSongTitle != null) playerSongTitle!!.setText(title)
-        if (playerSongSinger != null) playerSongSinger!!.setText(singer)
+        updateScrollingStatus(homePlayerTitle, currentAndNextText())
+        if (homePlayerSinger?.text?.toString() != singer) homePlayerSinger?.text = singer
+        if (playerSongTitle?.text?.toString() != title) playerSongTitle?.text = title
+        if (playerSongSinger?.text?.toString() != singer) playerSongSinger?.text = singer
         // 顶部状态栏 - 当前/下首
-        if (textCurrentSongTip != null) {
-            val cur =
-                "当前: " + title + (if (singer == null || singer.isEmpty()) "" else " - " + singer)
-            val nxt = if (orderQueue!!.size >= 2)
-                orderQueue.get(1).title + (if (orderQueue.get(1).singer == null || orderQueue.get(
-                        1
-                    ).singer!!.isEmpty()
-                ) "" else " - " + orderQueue.get(1).singer)
-            else
-                "无"
-            textCurrentSongTip!!.setText(cur + "  下首: " + nxt)
-        }
-        fullScreenSongInfo?.text = currentAndNextText()
+        updateScrollingStatus(textCurrentSongTip, currentAndNextText())
+        updateScrollingStatus(fullScreenSongInfo, currentAndNextText())
         updateOrderBadge()
         if (browseMode == "ordered" || browseMode == "sang" || browseMode == "downloads") {
             renderSongList()
+        }
+    }
+
+    private fun updateScrollingStatus(view: TextView?, info: String) {
+        view ?: return
+        if (view.text.toString() != info) view.text = info
+        // LoopingStatusTextView retains its animation phase when status/progress changes.
+        view.scrollTo(0, 0)
+    }
+
+    private val downloadStatusTicker = object : Runnable {
+        override fun run() {
+            if (isFinishing || isDestroyed) return
+            syncPlayerInfo()
+            refreshSongAdapter()
+            if (downloads.any { it.state in setOf("等待", "下载中") }) main.postDelayed(this, 1000L)
         }
     }
 
@@ -6781,7 +6933,17 @@ class MainActivity : AppCompatActivity() {
             else -> orderQueue?.firstOrNull { currentSong?.equals(it) != true }
         }?.let { song -> song.title.orEmpty() + song.singer?.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty() }
             ?: "无"
-        return "当前：$current    下一首：$next"
+        val downloading = downloads.filter { it.state in setOf("等待", "下载中") }
+            .joinToString("    ") { task ->
+                val transfer = SongOkDownloadManager.transferStatus(task.song)
+                val rate = transfer?.second ?: 0L
+                val speed = if (rate >= 1_048_576L) String.format(Locale.ROOT, "%.1f MB/s", rate / 1_048_576.0)
+                    else String.format(Locale.ROOT, "%.0f KB/s", rate / 1024.0)
+                "正在下载${task.song.title}（${transfer?.first ?: task.progress}%） $speed"
+            }
+        val playback = if (currentSong == null && next == "无" && downloading.isNotEmpty()) ""
+            else "当前：$current    下一首：$next"
+        return listOf(playback, downloading).filter { it.isNotEmpty() }.joinToString("    ")
     }
 
     /** 顶栏搜索按钮 - 跳到搜索页  */
@@ -7296,6 +7458,10 @@ class MainActivity : AppCompatActivity() {
                 val btn = TextView(this)
                 btn.setText(key)
                 btn.setTextSize(15f)
+                btn.isSingleLine = true
+                btn.includeFontPadding = false
+                androidx.core.widget.TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
+                    btn, 9, 15, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
                 btn.setTextColor(Color.rgb(241, 241, 241))
                 btn.setGravity(Gravity.CENTER)
                 btn.setBackgroundColor(Color.TRANSPARENT)
@@ -7541,21 +7707,15 @@ class MainActivity : AppCompatActivity() {
         val requestedPage = browsePage
         val requestedQuery = query.trim()
         io.execute {
-            val songs = if (requestedQuery.isEmpty()) {
-                library.muse.hotSongs(requestedPage * 6, 6)
-            } else {
-                library.muse.searchSongs(requestedQuery, requestedPage * 6, 6)
-            }
+            val searchResult = if (requestedQuery.isEmpty()) null
+                else library.search(requestedQuery, requestedPage * 6, 6)
+            val songs = searchResult?.songs ?: library.muse.hotSongs(requestedPage * 6, 6)
             val singers = if (requestedQuery.isEmpty()) {
                 library.muse.singers("", "", requestedPage * 4, 4)
             } else {
                 library.muse.searchSingers(requestedQuery, "", "", requestedPage * 4, 4)
             }
-            val total = if (requestedQuery.isEmpty()) {
-                library.muse.songCount()
-            } else {
-                library.muse.searchSongCount(requestedQuery)
-            }
+            val total = searchResult?.total ?: library.muse.songCount()
             main.post {
                 if (requestVersion != browseRequestVersion || browseMode != "quick" ||
                     browsePage != requestedPage || activeSearchQuery != requestedQuery
@@ -7575,6 +7735,9 @@ class MainActivity : AppCompatActivity() {
                         onSingerClick = { singer -> loadSingerSongs(singer.getOrNull(0), singer.getOrNull(1)) },
                         onSongClick = { song -> addToQueue(song) },
                         onSongMore = { song -> showSongActions(song) },
+                        stateFor = { song -> songRowState(song) },
+                        previousPageFocusId = btnPrevPage?.id ?: View.NO_ID,
+                        nextPageFocusId = btnNextPage?.id ?: View.NO_ID,
                     )
                 }
                 updatePageInfo()
@@ -7776,10 +7939,12 @@ class MainActivity : AppCompatActivity() {
      * 加载下载列表 (Tab 5)
      */
     private fun loadDownloadedList() {
-        currentTabIndex = 6
-        showSubPageShell("主页 / 下载")
-        setupTabs()
-        listTitle!!.setText("下载管理")
+        if (currentTabIndex != 6 || browseMode != "downloads") {
+            currentTabIndex = 6
+            showSubPageShell("主页 / 下载")
+            setupTabs()
+            listTitle!!.setText("下载管理")
+        }
         currentCategories.clear()
         currentCategoryIndex = 0
         browseMode = "downloads"
@@ -7803,21 +7968,19 @@ class MainActivity : AppCompatActivity() {
         val query = activeSearchQuery.trim().uppercase(Locale.ROOT)
         val requestedPage = browsePage
         val requestVersion = ++browseRequestVersion
-        val pageSize = MuseDatabase.PAGE_SIZE
+        val pageSize = IgebaCatalog.PAGE_SIZE
         io.execute {
             val localSongs = localSongInventory()
             downloads.asSequence().map { it.song }
                 .plus(library.allSongs().asSequence())
                 .forEach { song ->
-                if (song.hasLocalFile() || isDownloaded(song)) {
+                if (song.isOpenList() || song.hasLocalFile() || isDownloaded(song)) {
                     localSongs.putIfAbsent(stableId(song), song)
                 }
             }
             val filtered = localSongs.values.filter {
                 val languageMatches = language.isEmpty() || language == "全部" || it.language == language
-                val text = listOf(it.title, it.singer, it.pinyin, it.pinyinFull)
-                    .joinToString(" ").uppercase(Locale.ROOT)
-                languageMatches && (query.isEmpty() || query in text)
+                languageMatches && SongSearch.matches(it, query)
             }
             val from = (requestedPage * pageSize).coerceAtMost(filtered.size)
             val page = filtered.drop(from).take(pageSize)
@@ -7875,6 +8038,7 @@ class MainActivity : AppCompatActivity() {
             busy(true, "曲库加载中...")
             return
         }
+        val requestVersion = ++browseRequestVersion
         // 从数据库查询收藏歌曲
         io.execute(Runnable {
             val result: MutableList<Song> = ArrayList<Song>()
@@ -7884,11 +8048,12 @@ class MainActivity : AppCompatActivity() {
                 if (song != null) result.add(song)
             }
             main.post(Runnable {
-                visibleSongs.clear()
-                visibleSongs.addAll(result)
+                if (requestVersion != browseRequestVersion || browseMode != "favorites") return@Runnable
+                favoriteSongs.clear()
+                favoriteSongs.addAll(result)
                 updateCategories()
                 renderSongList()
-                if (visibleSongs.isEmpty()) toast("暂无收藏，长按歌曲可收藏")
+                if (favoriteSongs.isEmpty()) toast("暂无收藏，长按歌曲可收藏")
             })
         })
     }
@@ -7910,6 +8075,9 @@ class MainActivity : AppCompatActivity() {
         browsePagination?.visibility = View.GONE
 
         val entries = listOf(
+            SettingsEntry(R.drawable.ott_ic_about_us, "i歌霸账号", IgebaAccount.session?.let { "已登录：${it.nickname}" } ?: "登录或注册自己的账号", "设置") {
+                IgebaAccountDialog.show(this) { showSettingsPage(false) }
+            },
             SettingsEntry(R.drawable.ott_ic_data_setting, "数据设置", "数据库、歌曲下载、歌曲文件相关设置") { showSettingsSection(1) },
             SettingsEntry(R.drawable.ott_ic_play, "播放设置", "播放器、视频窗口相关设置") { showSettingsSection(2) },
             SettingsEntry(R.drawable.ott_ic_sound, "声音设置") { showSoundSettingsDialog() },
@@ -7940,6 +8108,7 @@ class MainActivity : AppCompatActivity() {
         currentTabIndex = 8
         showSubPageShell("主页 / 设置 / ${names[section]}")
         browseMode = "settings_section"
+        browseParam = section.toString()
         currentCategories.clear()
         updateCategories()
         keyboardArea?.visibility = View.GONE
@@ -7953,21 +8122,44 @@ class MainActivity : AppCompatActivity() {
             )
             1 -> listOf(
                 SettingsEntry(R.drawable.ott_ic_data_upgrade, "曲库", "数据库 ${library.muse.songCount()} 首  本地已下载 ${countDownloadedFiles()} 首", "更新") {
-                    io.execute { library.muse.close(); library.muse.open(); main.post { showSettingsSection(1, false) } }
+                    updateIgebaCatalog()
                 },
-                SettingsEntry(R.drawable.ott_ic_data_setting, "U盘加歌", "扫描U盘内按规定命名的歌曲文件，并添加到曲库中", "立即加歌") { toast("未检测到U盘") },
+                SettingsEntry(R.drawable.ott_ic_data_setting,
+                    if (store.downloadToOpenList) "网盘加歌" else "U盘加歌",
+                    if (store.downloadToOpenList) "扫描网盘歌曲目录并加入曲库检索" else "扫描 maidongktv 歌曲保存目录",
+                    "立即加歌") {
+                    if (store.downloadToOpenList) {
+                        if (openListBrowser.config().server.isBlank()) openListBrowser.show()
+                        else refreshLibraryImpl(Runnable {
+                            synchronized(browsePageCache) { browsePageCache.clear() }
+                            synchronized(browseCountCache) { browseCountCache.clear() }
+                            showSettingsSection(1, false)
+                            if (library.openListScanError == null) toast("网盘歌曲已加入曲库，可直接检索")
+                        }, true)
+                    } else chooseUsbFolder(false)
+                },
+                SettingsEntry(R.drawable.ott_ic_data_setting, "网盘设置", "配置 OpenList 服务和歌曲保存目录", "设置") { openListBrowser.show() },
+                SettingsEntry(R.drawable.ott_ic_setting_storage_space, "歌曲保存位置",
+                    when { store.downloadToOpenList -> "OpenList 网盘"; store.downloadToUsb -> "U盘存储"; else -> "本地存储" },
+                    "选择") { showDownloadLocationDialog() },
                 SettingsEntry(R.drawable.ott_ic_setting_storage_space, "预留存储空间", "当前 ${String.format(Locale.ROOT, "%.1f", reserveStorageGb)} GB") { showReserveStorageDialog() },
                 SettingsEntry(R.drawable.ott_ic_data_reset, "自动删歌", "当剩余存储空间低于预留空间时，自动删除最久未使用的歌曲", action = {
                     autoDeleteSongs = !autoDeleteSongs
                     saveState()
                     if (autoDeleteSongs) enforceStorageReserve(showResult = true)
                 }, checked = autoDeleteSongs),
-                SettingsEntry(R.drawable.ott_ic_data_upgrade, "重置数据库", "删除本地数据库并重新下载", "重置") { confirmResetDatabase() },
+                SettingsEntry(R.drawable.ott_ic_data_upgrade, "重置曲库", "清除本机缓存和已下载歌曲，恢复内置曲库，保留U盘", "重置") { confirmResetDatabase() },
                 SettingsEntry(R.drawable.ott_ic_setting_storage_space, "硬盘读写权限") { toast(storageStatusText()) },
             )
             2 -> listOf(
                 SettingsEntry(R.drawable.ott_ic_download_setting, "开机清空下载列表", "开机时删除本地已下载歌曲并清理数据库状态", action = { clearDownloadsOnBoot = !clearDownloadsOnBoot; saveState() }, checked = clearDownloadsOnBoot),
                 SettingsEntry(R.drawable.ott_ic_tv_display_mode, "自动全屏", "设置多久未操作后自动进入全屏", "设置间隔") { showAutoFullscreenDialog() },
+                SettingsEntry(R.drawable.ott_ic_play, "解码器",
+                    com.local.ktv.player.PlaybackDecoderSettings.load(this).title, "选择") { showDecoderDialog() },
+                SettingsEntry(R.drawable.ott_ic_play, "当前播放内核", playbackEngine.decoderSummary.substringBefore('\n'), "查看") {
+                    AlertDialog.Builder(this).setTitle("当前播放内核")
+                        .setMessage(playbackEngine.decoderSummary).setPositiveButton("关闭", null).create().showForTv()
+                },
                 SettingsEntry(R.drawable.ott_ic_play, "音画同步") { showAudioSyncDialog() },
                 SettingsEntry(R.drawable.ott_ic_marquee_setting, "歌曲片头字幕", action = { songTitleSubtitleEnabled = !songTitleSubtitleEnabled; saveState() }, checked = songTitleSubtitleEnabled),
             )
@@ -7986,6 +8178,7 @@ class MainActivity : AppCompatActivity() {
         if (requestInitialFocus) settingsAdapter.requestInitialFocus(songList!!)
     }
 
+
     private fun isNetworkConnected(): Boolean {
         val manager = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
         return manager?.activeNetworkInfo?.isConnected == true
@@ -7993,20 +8186,121 @@ class MainActivity : AppCompatActivity() {
 
     private fun networkStatusText(): String = if (isNetworkConnected()) "已连接" else "未连接"
 
-    private fun storageStatusText(): String {
-        val root = Environment.getExternalStorageDirectory()
-        return "可用 ${formatSize(root.usableSpace)} / 总计 ${formatSize(root.totalSpace)}"
+    private fun chooseUsbFolder(saveDownloads: Boolean, rootPath: String? = null) {
+        val previousPaths = library.allSongs().mapNotNull { it.path }.toSet()
+        busy(true, "正在检测U盘 / 内存卡...")
+        io.execute {
+            val roots = runCatching { SongStorage.usbRoots() }
+            main.post {
+                roots.onSuccess { available ->
+                    if (saveDownloads && rootPath == null && available.size > 1) {
+                        busy(false, "")
+                        AlertDialog.Builder(this).setTitle("选择U盘 / 内存卡")
+                            .setItems(available.map { "外置存储 ${it.name}" }.toTypedArray()) { _, which ->
+                                chooseUsbFolder(true, available[which].absolutePath)
+                            }.setNegativeButton("取消", null).showForTv()
+                    } else {
+                        io.execute {
+                            val result = runCatching {
+                                SongStorage.detectUsbRoot(writable = saveDownloads, preferredRoot = rootPath)
+                            }
+                            main.post {
+                                busy(false, "")
+                                result.onSuccess { root ->
+                                    store.usbTreeUri = root
+                                    if (saveDownloads) { store.downloadToUsb = true; store.downloadToOpenList = false }
+                                    showUsbSongs = true
+                                    saveState()
+                                    refreshLibrary {
+                                        if (saveDownloads) {
+                                            showSettingsSection(1, false)
+                                            toast("新下载将保存到外置存储 ${UsbMountDiscovery.SONG_DIRECTORY}")
+                                        } else {
+                                            showLocalPage()
+                                            if (SongStorage.usbScanError == null) {
+                                                val folders = available.map {
+                                                    File(it, UsbMountDiscovery.SONG_DIRECTORY).absolutePath + File.separator
+                                                }
+                                                val paths = library.allSongs().mapNotNull { it.path }
+                                                    .filter { path -> folders.any(path::startsWith) }.distinct()
+                                                val added = paths.count { it !in previousPaths }
+                                                toast("外置存储扫描完成：找到 ${paths.size} 首，新增 $added 首")
+                                            }
+                                        }
+                                    }
+                                }.onFailure { toast(it.message ?: "U盘不可用，请检查连接和读取权限") }
+                            }
+                        }
+                    }
+                }.onFailure {
+                    busy(false, "")
+                    toast(it.message ?: "无法读取U盘")
+                }
+            }
+        }
     }
 
+    private fun showDownloadLocationDialog() {
+        AlertDialog.Builder(this).setTitle("歌曲保存位置")
+            .setItems(arrayOf("本地存储", "U盘存储", "OpenList 网盘")) { _, which ->
+                when (which) {
+                    0 -> {
+                        store.downloadToUsb = false; store.downloadToOpenList = false
+                        saveState(); showSettingsSection(1, false)
+                    }
+                    1 -> chooseUsbFolder(true)
+                    2 -> {
+                        if (openListBrowser.config().server.isBlank()) openListBrowser.show()
+                        else {
+                            store.downloadToOpenList = true; store.downloadToUsb = false
+                            saveState(); showSettingsSection(1, false)
+                        }
+                    }
+                }
+            }.setNegativeButton("取消", null).showForTv()
+    }
+
+    private fun showSaveSongDialog(song: Song) {
+        AlertDialog.Builder(this).setTitle("保存歌曲到")
+            .setItems(arrayOf("本地存储", "U盘存储", "OpenList 网盘")) { _, which ->
+                if (which == 2 && openListBrowser.config().server.isBlank()) {
+                    toast("请先设置 OpenList"); openListBrowser.show(); return@setItems
+                }
+                if (which == 1) {
+                    val roots = SongStorage.usbRoots()
+                    if (roots.isEmpty()) {
+                        toast("未检测到U盘，请先使用U盘加歌"); return@setItems
+                    }
+                    val preferred = Uri.parse(store.usbTreeUri).path
+                    val selected = roots.firstOrNull { it.absolutePath == preferred } ?: roots.first()
+                    store.usbTreeUri = Uri.fromFile(selected).toString()
+                }
+                store.downloadToUsb = which == 1
+                store.downloadToOpenList = which == 2
+                saveState()
+                downloadSong(song)
+            }.setNegativeButton("取消", null).showForTv()
+    }
+
+    private fun storageStatusText(): String = runCatching {
+        val destination = SongStorage.choice()
+        val space = SongStorage.capacity(destination)
+        val label = if (destination.usb) "U盘" else "本地"
+        "$label 可用 ${formatSize(space.available)} / 总计 ${formatSize(space.total)}"
+    }.getOrElse { it.message ?: "保存位置不可用" }
+
     private fun downloadedSongDirectory(): File =
-        File(MuseDatabase.VIDEO_ROOT, MuseDatabase.CLOUD_SONG_DIR)
+        File(IgebaCatalog.VIDEO_ROOT, IgebaCatalog.CLOUD_SONG_DIR)
 
     private fun countDownloadedFiles(): Int = localSongInventory().size
 
     private fun localSongInventory(): LinkedHashMap<String, Song> {
         val result = LinkedHashMap<String, Song>()
+        library.allSongs().filter { it.hasLocalFile() }.forEach { song ->
+            result.putIfAbsent(stableId(song), song)
+        }
         library.muse.localPathSongs().forEach { song ->
-            val resolved = File(MuseDatabase.resolveSongFilePath(song))
+            val resolved = File(IgebaCatalog.resolveSongFilePath(song))
             if (SongFileValidator.inspect(
                     resolved,
                     SongFileValidator.requiresTransportStream(resolved),
@@ -8017,11 +8311,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val downloadedFiles = MuseDatabase.songDirectories()
+        val downloadedFiles = IgebaCatalog.songDirectories()
             .flatMap { it.listFiles().orEmpty().asIterable() }
             .distinctBy { it.name }
         val inspections = downloadedFiles.asSequence()
-            .filter { it.isFile && !it.name.endsWith(".download") }
+            .filter { it.isFile && it.extension.lowercase() in setOf("mkv", "mp4", "mpg", "mpeg", "avi", "ts", "mp3", "flac", "wav") }
             .associateWith { file ->
                 SongFileValidator.inspect(file, SongFileValidator.requiresTransportStream(file))
             }
@@ -8034,17 +8328,9 @@ class MainActivity : AppCompatActivity() {
             invalid.delete()
         }
         val validFiles = inspections.filter { (file, inspection) -> file.exists() && inspection.valid }.keys
-        val filesByName = validFiles.associateBy { it.name }
-        val databaseSongs = library.muse.songsByFilenames(filesByName.keys)
-        databaseSongs.forEach { song ->
-            filesByName[song.filename]?.let { song.path = it.absolutePath }
-            result.putIfAbsent(stableId(song), song)
-        }
-        val matchedNames = databaseSongs.mapNotNullTo(HashSet()) { it.filename }
-        validFiles.filter { it.name !in matchedNames }.forEach { file ->
-            val song = Song.local(file.absolutePath, file.name)
-            song.filename = file.name
-            result.putIfAbsent(stableId(song), song)
+        LocalSongResolver.resolve(validFiles.toList(), library.muse::songsByFilenames,
+            library.muse::songsByNumbers).forEach { song ->
+            result[stableId(song)] = song
         }
         return result
     }
@@ -8060,10 +8346,9 @@ class MainActivity : AppCompatActivity() {
         runCatching { stateDatabase.clearDownloads() }
     }
 
-    private fun isBelowReservedStorage(): Boolean {
-        val required = (reserveStorageGb * 1024.0 * 1024.0 * 1024.0).toLong()
-        return downloadedSongDirectory().usableSpace < required
-    }
+    private fun isBelowReservedStorage(): Boolean = runCatching {
+        SongStorage.capacity().available < SongStorage.choice().reserveBytes
+    }.getOrDefault(true)
 
     private fun enforceStorageReserve(showResult: Boolean = false) {
         if (!autoDeleteSongs || !isBelowReservedStorage()) return
@@ -8080,58 +8365,112 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun purgeColdDownloadedFiles(): Int {
-        val required = (reserveStorageGb * 1024.0 * 1024.0 * 1024.0).toLong()
-        val protectedNames = buildSet {
-            currentSong?.filename?.let(::add)
-            orderQueue.orEmpty().mapNotNullTo(this) { it.filename }
-        }
+    private fun purgeColdDownloadedFiles(
+        choice: SongStorage.Choice = SongStorage.choice(),
+        requiredAvailable: Long = choice.reserveBytes,
+    ): Int = synchronized(cacheCleanupLock) {
+        if (!SongStorage.automaticCleanup) return@synchronized 0
+        val directory = runCatching { SongStorage.directory(choice) }.getOrNull() ?: return@synchronized 0
         var deletedCount = 0
-        downloadedSongDirectory().listFiles().orEmpty()
-            .filter { it.isFile && it.name !in protectedNames && !it.name.endsWith(".download") }
-            .sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
-            .forEach { file ->
-                if (downloadedSongDirectory().usableSpace >= required) return deletedCount
-                cleanupSidecars(file)
-                if (file.delete()) {
-                    deletedCount++
-                    library.allSongs().filter { it.filename == file.name }.forEach { song ->
-                        song.path = null
-                        runCatching { stateDatabase.removeDownload(song) }
+        runCatching {
+            directory.entries()
+                .filter { it.info()?.directory == false && it.name !in protectedCacheNames &&
+                    !SongOkDownloadManager.isDownloadingFilename(it.name) &&
+                    it.name.substringAfterLast('.', "").lowercase() in
+                        setOf("mkv", "mp4", "mpg", "mpeg", "avi", "ts", "mp3", "flac", "wav") }
+                .sortedWith(compareBy<SongStorage.Media> { it.info()?.modified ?: 0 }.thenBy { it.name })
+                .forEach { media ->
+                    if (!SongStorage.automaticCleanup || SongStorage.capacity(choice).available >= requiredAvailable) return@synchronized deletedCount
+                    if (media.name in protectedCacheNames || SongOkDownloadManager.isDownloadingFilename(media.name)) return@forEach
+                    val cachedPath = media.path
+                    if (media.delete()) {
+                        listOf(".complete.json", ".resume.json", ".download").forEach { suffix ->
+                            directory.child(media.name + suffix).delete()
+                        }
+                        if (media is SongStorage.FileMedia) {
+                            SongFileValidator.forget(media.file)
+                            cleanupSidecars(media.file)
+                        }
+                        deletedCount++
+                        library.allSongs().filter { cachedPath != null && it.path == cachedPath }.forEach { song ->
+                            song.path = null
+                            runCatching { stateDatabase.removeDownload(song) }
+                        }
                     }
                 }
-            }
-        return deletedCount
+        }.onFailure { Log.w(TAG, "清理歌曲缓存失败", it) }
+        deletedCount
     }
 
     private fun confirmResetDatabase() {
         AlertDialog.Builder(this)
-            .setTitle("重置数据库")
-            .setMessage("将删除本地曲库数据库，然后从 Gitee 重新下载。不会保留备份，是否继续？")
+            .setTitle("重置曲库")
+            .setMessage("将停止播放和下载，清除本机歌曲缓存、已下载歌曲及点播记录，并恢复安装时内置曲库。收藏、自建歌单、导入文件和U盘内容保留，是否继续？")
             .setNegativeButton("取消", null)
-            .setPositiveButton("确认") { _, _ -> resetDatabaseFromGitee() }
+            .setPositiveButton("确认") { _, _ -> resetLocalLibrary() }
             .create().showForTv()
     }
 
-    private fun resetDatabaseFromGitee() {
-        showDatabaseLoading(true, "正在重置数据库...", null)
+    private fun resetLocalLibrary() {
+        if (databaseBootstrapRunning) return
+        databaseBootstrapRunning = true
+        playbackGeneration++
+        randomLocalRequestSerial++
+        browseRequestVersion++
+        playWhenPrepared = false
+        playbackPreparing = false
+        main.removeCallbacks(autoFullscreenRunnable)
+        releaseVocalPlayer()
+        player?.stopPlayback()
+        currentSong = null
+        pendingQueueSongIds.clear()
+        pendingQueueCacheNames.clear()
+        downloads.forEach { it.cancelled = true }
+        showDatabaseLoading(true, "正在清理本机缓存并恢复内置曲库...", null)
         io.execute {
-            library.muse.close()
-            MuseDatabase.defaultDbFile().delete()
-            val result = DatabaseBootstrapper.download(::showDatabaseDownloadProgress)
-            val opened = result.isSuccess && library.muse.open()
+            val result = runCatching {
+                SongOkDownloadManager.resetLocalCache {
+                    library.muse.close()
+                    OwnedSongCacheCleaner.clear(AppPaths.cloudSongsDir)
+                    OwnedSongCacheCleaner.clear(AppPaths.songsDir)
+                    OwnedSongCacheCleaner.clear(cacheDir)
+                    library.clearRemoteCache()
+                    check(android.database.sqlite.SQLiteDatabase.deleteDatabase(AppPaths.databaseFile)) { "无法清除本机曲库" }
+                    listOf("igeba_catalog.sync", "igeba_catalog.previous", "igeba_catalog.db.install").forEach { name ->
+                        val file = File(AppPaths.databaseDir, name)
+                        check(!file.exists() || file.delete()) { "无法清除曲库临时文件" }
+                    }
+                    CatalogAssets.install()
+                    check(library.muse.open()) { "无法打开内置曲库" }
+                    stateIo.submit { stateDatabase.clearLibraryHistory() }.get()
+                }
+            }
             main.post {
-                if (opened) {
-                    showDatabaseLoading(false, "", null)
-                    toast("数据库重置完成")
+                databaseBootstrapRunning = false
+                showDatabaseLoading(false, "", null)
+                result.onSuccess {
+                    orderQueue?.clear()
+                    sangHistory.clear()
+                    downloads.clear()
+                    store.hiddenSongIds.clear()
+                    remoteSongCache.clear()
+                    synchronized(browsePageCache) { browsePageCache.clear() }
+                    synchronized(browseCountCache) { browseCountCache.clear() }
+                    visibleSongs.clear()
+                    store.downloadToUsb = false
+                    saveState()
+                    hideDownloadProgress()
+                    updateBottomBar(null, false)
+                    refreshLibrary { showHomePage(); toast("本机缓存已清除，已恢复内置曲库") }
+                    Log.i(TAG, "Local library reset completed; USB files preserved")
+                }.onFailure {
+                    runCatching { library.muse.open() }
+                    toast("重置未完成：" + (it.message ?: "本机缓存不可写"))
                     showSettingsSection(1, false)
-                } else {
-                    showDatabaseLoadingFailure("数据库重置失败：${result.exceptionOrNull()?.message.orEmpty()}")
                 }
             }
         }
     }
-
     private fun showDatabaseLoading(show: Boolean, message: String, progressValue: Int?) {
         if (!show) {
             databaseLoadingOverlay?.visibility = View.GONE
@@ -8273,13 +8612,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showDecoderDialog() {
+        val modes = com.local.ktv.player.PlaybackDecoderMode.entries
+        var pending = modes.indexOf(com.local.ktv.player.PlaybackDecoderSettings.load(this))
+        val choices = dialogSingleChoiceGroup(modes.map { it.title }.toTypedArray(), pending) { pending = it }
+        AlertDialog.Builder(this)
+            .setTitle("解码器")
+            .setMessage("自动模式优先使用 ExoPlayer，播放失败后切换 FFmpeg。修改从下一首歌曲生效。")
+            .setView(choices)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确认") { _, _ ->
+                com.local.ktv.player.PlaybackDecoderSettings.save(this, modes[pending])
+                toast("已选择 ${modes[pending].title}，下一首歌曲生效")
+                showSettingsSection(2, false)
+            }.create().showForTv()
+    }
+
     private fun showScreenDialog() {
-        val items = arrayOf<String>("16 : 9", "4 : 3", "全屏")
-        val selected = when (screenMode) {
-            "16 : 9" -> 0
-            "4 : 3" -> 1
-            else -> 2
-        }
+        val items = arrayOf("16 : 9", "4 : 3", "全屏")
+        val selected = items.indexOf(screenMode).coerceAtLeast(0)
         var pending = selected
         val choices = dialogSingleChoiceGroup(items, selected) { pending = it }
         AlertDialog.Builder(this)
@@ -8311,20 +8662,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showReserveStorageDialog() {
-        val totalGb = downloadedSongDirectory().totalSpace.toDouble() / 1024.0 / 1024.0 / 1024.0
-        val values = listOf(0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
-            .filter { it <= max(0.5, totalGb * 0.95) }
-            .ifEmpty { listOf(0.5) }
+        val availableGb = runCatching { SongStorage.capacity().available.coerceAtLeast(0).toDouble() / 1_073_741_824.0 }
+            .getOrElse { toast(it.message ?: "保存位置不可用"); return }
+        val values = (listOf(0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
+            .filter { it <= availableGb } + minOf(64.0, availableGb)).distinct().sorted()
+        reserveStorageGb = reserveStorageGb.coerceIn(0.0, minOf(64.0, availableGb))
+        saveState()
         val labels = values.map { value ->
-            "${String.format(Locale.ROOT, if (value < 1) "%.1f" else "%.0f", value)} GB"
+            "${String.format(Locale.ROOT, "%.2f", value)} GB"
         }.toTypedArray()
         var selected = values.indices.minByOrNull { kotlin.math.abs(values[it] - reserveStorageGb) } ?: 0
-        AlertDialog.Builder(this).setTitle("预留存储空间")
+        AlertDialog.Builder(this).setTitle("预留存储空间（可用 ${String.format(Locale.ROOT, "%.2f", availableGb)} GB）")
             .setSingleChoiceItems(labels, selected) { _, which -> selected = which }
             .setNegativeButton("取消", null).setPositiveButton("保存") { _, _ ->
-                reserveStorageGb = values[selected]
+                val currentAvailable = runCatching { SongStorage.capacity().available.coerceAtLeast(0).toDouble() / 1_073_741_824.0 }
+                    .getOrElse { toast(it.message ?: "保存位置不可用"); return@setPositiveButton }
+                reserveStorageGb = values[selected].coerceAtMost(currentAvailable)
                 saveState()
-                if (autoDeleteSongs) enforceStorageReserve(showResult = true)
                 showSettingsSection(1, false)
             }.create().showForTv()
     }
@@ -8681,7 +9035,7 @@ class MainActivity : AppCompatActivity() {
      * 加载浏览分页数据
      */
     private fun loadBrowsePage() {
-        if (!library.muse.isAvailable()) {
+        if (!library.muse.isAvailable() && browseMode != "search") {
             catalogRefreshPending = true
             busy(true, "曲库加载中...")
             return
@@ -8697,7 +9051,7 @@ class MainActivity : AppCompatActivity() {
         val pageSize = when (requestedMode) {
             "rank" -> 6
             "singer_list" -> 8
-            else -> MuseDatabase.PAGE_SIZE
+            else -> IgebaCatalog.PAGE_SIZE
         }
         val key = BrowseCacheKey(
             requestedMode,
@@ -8707,7 +9061,9 @@ class MainActivity : AppCompatActivity() {
             requestedPage,
             pageSize,
         )
-        val cached = synchronized(browsePageCache) { browsePageCache[key] }
+        // 搜索包含可插拔介质，不复用旧页面，避免加歌/拔盘后仍返回过期结果。
+        val cached = if (requestedMode == "search") null
+            else synchronized(browsePageCache) { browsePageCache[key] }
         if (cached != null) {
             applyBrowsePage(key, cached, requestVersion)
             prefetchBrowseNeighbors(key, cached.total)
@@ -8738,6 +9094,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun queryBrowsePage(key: BrowseCacheKey): BrowsePageResult {
+            if (key.mode == "search") {
+                val result = library.search(key.param, key.page * key.pageSize, key.pageSize, key.language)
+                return BrowsePageResult(result.songs, result.total)
+            }
             var songs: MutableList<Song>? = null
             val countKey = browseCountKey(key)
             var total = synchronized(browseCountCache) { browseCountCache[countKey] } ?: -1
@@ -8785,10 +9145,6 @@ class MainActivity : AppCompatActivity() {
                         if (total < 0) total = library.muse.countSearchSongsBySinger(key.param, key.searchQuery)
                     }
 
-                    "search" -> {
-                        songs = library.muse.searchSongs(key.param, offset, key.pageSize, key.language)
-                        if (total < 0) total = library.muse.searchSongCount(key.param, key.language)
-                    }
 
                     "favorite" -> {
                         // 收藏功能暂未实现,返回空列表
@@ -8873,40 +9229,98 @@ class MainActivity : AppCompatActivity() {
     /**
      * 轻量刷新当前歌曲列表 Adapter (不重建), 用于下载状态变更后即时更新 UI。
      */
-    private fun refreshSongAdapter() {
-        modernSongAdapter?.let { adapter ->
-            if (songList?.adapter === adapter) adapter.notifyDataSetChanged()
+    private data class SongFocusAnchor(val marker: String, val scope: String, val inputSerial: Int)
+    private var songFocusAnchor: SongFocusAnchor? = null
+
+    private fun songFocusScope(): String =
+        listOf(currentPage, browseMode, browseParam, activeSearchQuery, browsePage, currentTabIndex).joinToString("\u0001")
+
+    private fun rememberSongFocus(): SongFocusAnchor? {
+        val list = songList ?: return null
+        if (window.decorView.isInTouchMode) {
+            songFocusAnchor = null
+            return null
         }
+        val scope = songFocusScope()
+        songFocusAnchor?.takeIf { it.scope == scope && it.inputSerial == focusRestoreSerial }?.let { return it }
+        val focused = window.decorView.findFocus()?.takeIf { isDescendantOf(it, list) }
+        val marker = focused?.focusMarker()?.takeIf { it.startsWith(SongListAdapter.FOCUS_PREFIX) }
+        return marker?.let { SongFocusAnchor(it, scope, focusRestoreSerial) }.also { songFocusAnchor = it }
+    }
+
+    private fun retainSongFocus(anchor: SongFocusAnchor?) {
+        anchor ?: return
+        val list = songList ?: return
+        fun restore() {
+            if (focusRestoreSerial != anchor.inputSerial || songFocusScope() != anchor.scope ||
+                !window.decorView.hasWindowFocus() || window.decorView.isInTouchMode) return
+            val exact = findViewByFocusMarker(list, anchor.marker)
+            val target = exact?.takeIf { it.isShown && it.isFocusable } ?:
+                findViewByFocusMarker(list, anchor.marker.substringBefore("|action|"))
+                    ?.takeIf { it.isShown && it.isFocusable }
+            if (target != null && !target.hasFocus()) target.requestFocus()
+        }
+        // ListView can move focus during its next layout pass. Recheck after that pass too.
+        list.post { restore() }
+        list.postDelayed({ restore() }, 60L)
+    }
+
+    private fun refreshSongAdapter() {
+        val list = songList ?: return
+        val anchor = rememberSongFocus()
+        when (val adapter = list.adapter) {
+            is SongListAdapter -> if (!adapter.refreshVisibleStates(list)) renderSongList()
+            is QuickSearchAdapter -> adapter.refreshVisibleStates(list)
+        }
+        retainSongFocus(anchor)
     }
 
     /**
      * 渲染歌曲列表
      */
     private fun renderSongList() {
+        val anchor = rememberSongFocus()
+        renderSongListContents()
+        retainSongFocus(anchor)
+    }
+
+    private fun renderSongListContents() {
         val list = songList ?: return
         val focusedView = window.decorView.findFocus()?.takeIf { isDescendantOf(it, list) }
         val focusedMarker = focusedView?.focusMarker()
             ?.takeIf { it.startsWith(SongListAdapter.FOCUS_PREFIX) }
         val oldSelectedPosition = list.selectedItemPosition
-        val oldFocusedTop = focusedView?.top
-        if (browseMode == "ordered") {
+        val focusedRow = generateSequence(focusedView) { it.parent as? View }
+            .firstOrNull { it.parent === list }
+        val oldFocusedTop = focusedRow?.top
+        val personalSongs = when (browseMode) {
+            "ordered" -> orderQueue.orEmpty()
+            "sang" -> sangHistory
+            "downloads" -> downloads.map { it.song }
+            "favorites" -> favoriteSongs
+            else -> null
+        }
+        if (personalSongs != null) {
+            val pageSize = browsePageSize()
+            browseTotalCount = personalSongs.size
+            browseTotalPages = (personalSongs.size + pageSize - 1) / pageSize
+            browsePage = browsePage.coerceIn(0, max(0, browseTotalPages - 1))
+            val pageSongs = personalSongs.drop(browsePage * pageSize).take(pageSize)
             visibleSongs.clear()
-            visibleSongs.addAll(orderQueue.orEmpty())
-        } else if (browseMode == "sang") {
-            visibleSongs.clear()
-            visibleSongs.addAll(sangHistory)
+            visibleSongs.addAll(pageSongs)
+            updatePageInfo()
         }
         if (visibleSongs.isEmpty()) {
             modernSongAdapter = null
             list.adapter = tvAdapter().apply { add("暂无歌曲") }
             return
         }
-        list.dividerHeight = 0
+        if (list.dividerHeight != 0) list.dividerHeight = 0
         val mode = when (browseMode) {
             "rank", "ordered", "downloads", "sang" -> browseMode
             else -> "catalog"
         }
-        val pageOffset = if (mode == "rank") browsePage * browsePageSize() else 0
+        val pageOffset = browsePage * browsePageSize()
         val existing = modernSongAdapter?.takeIf { it.matches(mode, pageOffset) && list.adapter === it }
         val listAdapter = existing ?: SongListAdapter(
             this,
@@ -8918,7 +9332,7 @@ class MainActivity : AppCompatActivity() {
             { song -> songRowState(song) },
             SongListCallbacks(
                 onPrimary = { song -> handleSongPrimary(song) },
-                onDownload = { song -> downloadSong(song) },
+                onDownload = { song -> showSaveSongDialog(song) },
                 onMore = { song -> showSongActions(song) },
                 onTop = { song -> moveQueuedSongToNext(song) },
                 onDelete = { song ->
@@ -8930,17 +9344,18 @@ class MainActivity : AppCompatActivity() {
             modernSongAdapter = it
             list.adapter = it
         }
+        if (existing != null && listAdapter.refreshVisibleStates(list)) return
         if (existing != null) listAdapter.notifyDataSetChanged()
 
-        val targetPosition = focusedMarker?.let(listAdapter::adapterPositionFor)
-            ?: oldSelectedPosition.takeIf { it >= 0 }
+        val targetPosition = (focusedMarker?.let(listAdapter::adapterPositionFor)
+            ?: oldSelectedPosition.takeIf { it >= 0 })?.coerceIn(0, listAdapter.count - 1)
         if (targetPosition != null && focusedMarker != null) {
-            list.setSelectionFromTop(targetPosition, oldFocusedTop ?: 0)
+            val restoreSerial = focusRestoreSerial
+            list.setSelectionFromTop(targetPosition, (oldFocusedTop ?: list.paddingTop) - list.paddingTop)
             list.post {
-                if (list.adapter !== listAdapter) return@post
-                list.setSelection(targetPosition)
+                if (list.adapter !== listAdapter || restoreSerial != focusRestoreSerial) return@post
                 val row = list.getChildAt(targetPosition - list.firstVisiblePosition)
-                val target = row?.let { findViewByFocusMarker(it, focusedMarker) }
+                val target = row?.let { findViewByFocusMarker(it, focusedMarker) } ?: row
                 if (target != null) {
                     target.requestFocus()
                     target.refreshDrawableState()
@@ -8962,17 +9377,18 @@ class MainActivity : AppCompatActivity() {
     private fun songRowState(song: Song): SongRowState {
         val task = downloads.lastOrNull { stableId(it.song) == stableId(song) }
         val taskState = task?.state.orEmpty()
+        val localFile = song.hasLocalFile()
         return SongRowState(
             current = currentSong?.equals(song) == true,
-            queued = orderQueue!!.contains(song),
-            local = song.hasLocalFile(),
-            downloading = isDownloading(song),
+            queued = orderQueue!!.contains(song) || pendingQueueSongIds.contains(stableId(song)),
+            local = localFile,
+            source = songSource(song, localFile),
+            downloading = !taskState.startsWith("失败") && !taskState.contains("暂停") && isDownloading(song),
             failed = taskState.startsWith("失败"),
             paused = taskState.contains("暂停") || taskState.contains("中断"),
-            progress = task?.progress ?: SongOkDownloadManager.getDownloadProgress(song),
+            progress = SongOkDownloadManager.transferStatus(song)?.first ?: task?.progress ?: 0,
         )
     }
-
     private fun handleSongPrimary(song: Song) {
         var rendered = false
         when (browseMode) {
@@ -9027,25 +9443,39 @@ class MainActivity : AppCompatActivity() {
             toast("正在播放的歌曲不能删除")
             return
         }
+        val originalPath = song.path
+        val removeTask = browseMode == "downloads"
+        pendingQueueSongIds.remove(stableId(song))
+        pendingQueueCacheNames.remove(stableId(song))
+        persistRuntimeState()
         SongOkDownloadManager.cancelDownload(song)
-        val files = listOfNotNull(song.path?.let(::File), SongOkDownloadManager.getLocalFile(song))
-            .distinctBy { it.absolutePath }
         io.execute {
-            val failed = files.filter { file ->
-                if (!file.exists()) return@filter false
-                cleanupSidecars(file)
-                !runCatching { file.delete() }.getOrDefault(false)
-            }
-            if (failed.isEmpty()) {
-                song.path = null
+            val deleted = runCatching {
+                val media = originalPath?.let(SongStorage::fromPath)
+                val cacheDeleted = SongOkDownloadManager.deleteCache(song)
+                val importedDeleted = if (media?.info() == null) true else {
+                    val removed = media.delete()
+                    if (removed && media is SongStorage.FileMedia) {
+                        cleanupSidecars(media.file)
+                        SongFileValidator.forget(media.file)
+                    }
+                    removed
+                }
+                cacheDeleted && importedDeleted
+            }.getOrDefault(false)
+            if (deleted || removeTask) {
+                if (deleted) song.path = null
                 runCatching { stateDatabase.removeDownload(song) }
                 main.post {
                     downloads.removeAll { stableId(it.song) == stableId(song) }
-                    if (browseMode == "downloads") loadDownloadedList() else reloadCurrentBrowsePage()
-                    toast("已删除本地文件")
+                    refreshLibrary {
+                        if (browseMode == "downloads") loadDownloadedList() else reloadCurrentBrowsePage()
+                    }
+                    toast(if (deleted) "下载任务及缓存已删除" else "下载任务已删除，部分缓存暂不可清理")
                 }
             } else {
-                main.post { toast("文件删除失败，请检查存储权限") }
+                song.path = originalPath
+                main.post { toast("文件删除失败，请检查存储权限和U盘连接") }
             }
         }
     }
@@ -9079,6 +9509,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun reloadCurrentBrowsePage() {
         when (browseMode) {
+            "favorites", "sang", "ordered", "downloads" -> renderSongList()
             "singer_list" -> loadSingerList(browseParam, activeSearchQuery)
             "local" -> loadLocalCatalogPage()
             "category_list" -> loadCategoryPlaylistPage(activeSearchQuery)
@@ -9173,14 +9604,21 @@ class MainActivity : AppCompatActivity() {
      */
     private fun updateOrderBadge() {
         val n = if (orderQueue == null) 0 else orderQueue.size
-        if (textTopOrderBadge != null) textTopOrderBadge!!.setText(n.toString())
-        if (textOrderBadge != null) textOrderBadge!!.setText(n.toString())
+        val count = n.toString()
+        listOfNotNull(textTopOrderBadge, textOrderBadge).forEach { badge ->
+            if (badge.text.toString() != count) badge.text = count
+        }
     }
 
     /**
      * 添加歌曲到已点列表
      */
     private fun addToQueue(song: Song) {
+        if (!isSongReadyForQueue(song) && !song.isOpenList() && song.sourceSongNumber != null && IgebaAccount.session == null) {
+            toast("请先登录 i歌霸账号")
+            IgebaAccountDialog.show(this) { refreshSongAdapter() }
+            return
+        }
         if (orderQueue!!.contains(song)) {
             toast("已在列表中: " + song.title)
             return
@@ -9188,18 +9626,22 @@ class MainActivity : AppCompatActivity() {
         if (!isSongReadyForQueue(song)) {
             val id = stableId(song)
             val newlyPending = pendingQueueSongIds.add(id)
+            pendingQueueCacheNames[id] = getLocalFile(song).name
+            persistRuntimeState()
             toast(
                 if (newlyPending) "正在下载，完成后自动加入已点：${song.title}"
                 else "歌曲正在下载，尚未进入已点：${song.title}",
             )
             if (!isDownloading(song)) downloadSong(song)
+            refreshSongAdapter()
+            syncPlayerInfo()
             return
         }
         addReadySongToQueue(song)
     }
 
     private fun isSongReadyForQueue(song: Song): Boolean =
-        SongOkDownloadManager.isDownloaded(song) || song.hasLocalFile()
+        song.isOpenList() || SongOkDownloadManager.isDownloaded(song) || song.hasLocalFile()
 
     private fun addReadySongToQueue(song: Song) {
         if (orderQueue!!.contains(song)) return
@@ -9214,6 +9656,8 @@ class MainActivity : AppCompatActivity() {
         if (currentPage == "已点" || currentPage == "首页") renderQueue()
         toast("已点: " + song.title + (if (song.singer != null) " - " + song.singer else ""))
         if (wasQueueEmpty) play(song)
+        refreshSongAdapter()
+        syncPlayerInfo()
     }
 
     private fun scheduleAutoFullscreen() {
@@ -9270,6 +9714,8 @@ class MainActivity : AppCompatActivity() {
         store.autoFullscreenSeconds = autoFullscreenSeconds
         store.showUsbSongs = showUsbSongs
         store.autoDeleteSongs = autoDeleteSongs
+        SongStorage.configure(store.downloadToUsb, store.usbTreeUri, reserveStorageGb, showUsbSongs, autoDeleteSongs)
+        reserveStorageGb = SongStorage.choice().reserveBytes.toDouble() / 1_073_741_824.0
         store.reserveStorageGb = reserveStorageGb
         store.floatingButtonEnabled = floatingButtonEnabled
         store.songTitleSubtitleEnabled = songTitleSubtitleEnabled
@@ -9280,7 +9726,6 @@ class MainActivity : AppCompatActivity() {
         store.voiceEngineVolume = voiceEngineVolume
         store.lightMode = lightMode!!
         store.audioDelayMs = audioDelayMs
-        store.screenBrightness = screenBrightness
         store.screenMode = screenMode
         store.doubleScreenEnabled = doubleScreenEnabled
         store.tableBroadcastEnabled = tableBroadcastEnabled
@@ -9292,6 +9737,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun persistRuntimeState() {
+        protectedCacheNames = buildSet {
+            currentSong?.filename?.let(::add)
+            orderQueue.orEmpty().mapNotNullTo(this) { it.filename }
+            addAll(pendingQueueCacheNames.values)
+        }
         if (!::stateDatabase.isInitialized) return
         val playbackState = when {
             currentSong == null -> "idle"
@@ -9333,6 +9783,9 @@ class MainActivity : AppCompatActivity() {
         showUsbSongs = store.showUsbSongs
         autoDeleteSongs = store.autoDeleteSongs
         reserveStorageGb = store.reserveStorageGb
+        SongStorage.configure(store.downloadToUsb, store.usbTreeUri, reserveStorageGb, showUsbSongs, autoDeleteSongs)
+        reserveStorageGb = SongStorage.choice().reserveBytes.toDouble() / 1_073_741_824.0
+        store.reserveStorageGb = reserveStorageGb
         floatingButtonEnabled = store.floatingButtonEnabled
         songTitleSubtitleEnabled = store.songTitleSubtitleEnabled
         orderedSongOriginal = store.orderedSongOriginal
@@ -9342,8 +9795,7 @@ class MainActivity : AppCompatActivity() {
         voiceEngineVolume = store.voiceEngineVolume
         lightMode = store.lightMode
         audioDelayMs = store.audioDelayMs
-        screenBrightness = store.screenBrightness
-        screenMode = store.screenMode
+        screenMode = store.screenMode.takeIf { it != "适应屏幕" } ?: "16 : 9"
         doubleScreenEnabled = store.doubleScreenEnabled
         tableBroadcastEnabled = store.tableBroadcastEnabled
         tableBroadcastSeconds = store.tableBroadcastSeconds
@@ -9389,6 +9841,15 @@ class MainActivity : AppCompatActivity() {
         if (event.getAction() != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
         focusRestoreSerial++
         val code = event.getKeyCode()
+        if (code in KeyEvent.KEYCODE_DPAD_UP..KeyEvent.KEYCODE_DPAD_CENTER) {
+            main.post {
+                val target = window.decorView.findFocus()
+                android.util.Log.d("KtvFocus", "key=$code marker=${target?.focusMarker()} " +
+                    "view=${target?.javaClass?.simpleName} id=${target?.id} " +
+                    "attached=${target?.isAttachedToWindow} focused=${target?.isFocused} " +
+                    "touch=${window.decorView.isInTouchMode}")
+            }
+        }
         if (isFullScreen) {
             val center = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER ||
                 code == KeyEvent.KEYCODE_NUMPAD_ENTER
@@ -9459,6 +9920,9 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }
+        if (!isFullScreen && browseMode !in setOf("settings", "settings_section") &&
+            TvListNavigation.handle(songList, btnBack, btnPrevPage, btnNextPage, code)
+        ) return true
         val homeDirection = homeLayout?.visibility == View.VISIBLE && currentPage == "首页" &&
             (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT ||
                 code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN)

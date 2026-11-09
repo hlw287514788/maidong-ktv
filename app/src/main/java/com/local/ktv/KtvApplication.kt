@@ -2,13 +2,14 @@ package com.local.ktv
 
 import android.app.Application
 import android.util.Log
-import com.liulishuo.okdownload.OkDownload
 
 class KtvApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         instanceRef = this
-        OkDownload.setSingletonInstance(OkDownload.Builder(this).build())
+        IgebaAccount.initialize(this)
+        PersonalMediaStore.init(this)
+        CatalogAssets.init(this)
         Log.i(TAG, "KTV application initialized without native services")
     }
 

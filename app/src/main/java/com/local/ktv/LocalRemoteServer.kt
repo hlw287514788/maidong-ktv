@@ -44,7 +44,12 @@ class LocalRemoteServer(private val context: Context) {
 
     @Synchronized
     fun start(address: String?, callback: Callback): Boolean {
-        if (running && address == boundAddress) return true
+        if (running && server?.isClosed == false && isPrivateIpv4(address)) {
+            this.callback = callback
+            boundAddress = address
+            lastError = null
+            return true
+        }
         stop()
         this.callback = callback
         if (!isPrivateIpv4(address)) {
@@ -55,7 +60,10 @@ class LocalRemoteServer(private val context: Context) {
         var candidate: ServerSocket? = null
         for (port in 8765..8775) {
             try {
-                candidate = ServerSocket(port, 32)
+                candidate = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(java.net.InetSocketAddress(port), 32)
+                }
                 boundPort = port
                 break
             } catch (_: Exception) {
@@ -65,20 +73,25 @@ class LocalRemoteServer(private val context: Context) {
             lastError = "端口 8765–8775 均被占用"
             return false
         }
-        server = candidate
+        val listener = candidate
+        server = listener
         boundAddress = address
         lastError = null
         running = true
         pool.execute {
             try {
-                while (running) {
-                    val socket = server?.accept() ?: break
+                while (running && server === listener) {
+                    val socket = listener.accept()
                     pool.execute { handle(socket) }
                 }
             } catch (e: Exception) {
-                if (running) lastError = e.message ?: "本地服务异常"
+                synchronized(this@LocalRemoteServer) {
+                    if (running && server === listener) lastError = e.message ?: "本地服务异常"
+                }
             } finally {
-                running = false
+                synchronized(this@LocalRemoteServer) {
+                    if (server === listener) running = false
+                }
             }
         }
         return true
@@ -164,6 +177,8 @@ class LocalRemoteServer(private val context: Context) {
         ApiResponse(404, error("ASSET_NOT_FOUND", "页面资源缺失"))
     }
 
+    // The drawable is a packaged PNG; openRawResource returns its original encoded bytes.
+    @android.annotation.SuppressLint("ResourceType")
     private fun logoAsset(): ApiResponse = try {
         val bytes = context.resources.openRawResource(R.drawable.ktv_logo).use { it.readBytes() }
         ApiResponse(200, contentType = "image/png", bytes = bytes)
@@ -225,6 +240,7 @@ class LocalRemoteServer(private val context: Context) {
 
     companion object {
         fun isPrivateIpv4(value: String?): Boolean = runCatching {
+            if (value.isNullOrBlank()) return@runCatching false
             val address = InetAddress.getByName(value)
             address is Inet4Address && isPrivateAddress(address)
         }.getOrDefault(false)
