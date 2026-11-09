@@ -111,6 +111,9 @@ jobs:
           name: maidong-h2-release
           path: upstream/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+          # Artifact retention: 7 days, so old builds auto-delete and
+          # storage does not accumulate (zero-cost rule, 2026-11-03).
+          retention-days: 7
 
       - name: Upload newly generated keystore (first run only - SAVE IT)
         if: steps.keystore.outputs.generated == 'true'
