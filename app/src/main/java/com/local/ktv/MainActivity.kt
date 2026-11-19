@@ -133,7 +133,8 @@ class MainActivity : AppCompatActivity() {
     private val keyboardSearchRunnable = Runnable { performSearch() }
     private val io: ExecutorService = Executors.newFixedThreadPool(4)
     private val stateIo: ExecutorService = Executors.newSingleThreadExecutor()
-    private val library = SongLibrary()
+    private val libraryDelegate = lazy { SongLibrary() }
+    private val library by libraryDelegate
     private val openListBrowser by lazy { OpenListBrowser(this, io) {
         refreshLibrary {
             showSettingsSection(1, false)
@@ -435,7 +436,12 @@ class MainActivity : AppCompatActivity() {
             requestStorage()
             return
         }
-        AppPaths.ensureDirectories()
+        runCatching { AppPaths.ensureDirectories() }.onFailure { error ->
+            android.util.Log.e("MainActivity", "本机存储初始化失败", error)
+            android.widget.Toast.makeText(this, "无法写入本机存储", android.widget.Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         store.load()
         loadStateFromStore()
         stateDatabase = KtvStateDatabase(applicationContext)
@@ -646,7 +652,7 @@ class MainActivity : AppCompatActivity() {
         remoteServer.stop()
         SongOkDownloadManager.orderSnapshot = null
         SongOkDownloadManager.reclaimCache = null
-        library.muse.close()
+        if (libraryDelegate.isInitialized()) library.muse.close()
         stateIo.shutdown()
         runCatching { stateIo.awaitTermination(2, TimeUnit.SECONDS) }
         if (::stateDatabase.isInitialized) stateDatabase.close()
@@ -6425,7 +6431,13 @@ class MainActivity : AppCompatActivity() {
         rightColumn = findViewById<LinearLayout?>(R.id.right_column)
         subCategoryScroll = findViewById<HorizontalScrollView?>(R.id.sub_category_scroll)
         keyboardArea = findViewById<View?>(R.id.keyboard_area)
-        rankCategoryGrid = findViewById(R.id.rank_category_grid)
+        rankCategoryGrid = findViewById<GridLayout>(R.id.rank_category_grid)?.apply {
+            addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
+                    updateRankCategoryGrid()
+                }
+            }
+        }
         paginationBar = findViewById<View?>(R.id.pagination_bar)
         fullScreenContainer = findViewById<FrameLayout?>(R.id.container)
 
@@ -7582,43 +7594,61 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateRankCategoryGrid() {
         val grid = rankCategoryGrid ?: return
+        if (grid.visibility != View.VISIBLE || currentTabIndex != 9 || browseMode != "rank") return
+        val categories = currentCategories.take(9)
+        if (categories.isEmpty()) {
+            grid.removeAllViews()
+            return
+        }
+        // 部分 Android 5.1 固件无法按 GridLayout 权重分配尺寸，改用布局完成后的实际宽高。
+        val columns = 3
+        val rows = (categories.size + columns - 1) / columns
+        val margin = dp(3)
+        val cellW = (grid.width - grid.paddingLeft - grid.paddingRight - margin * 2 * columns) / columns
+        val cellH = (grid.height - grid.paddingTop - grid.paddingBottom - margin * 2 * rows) / rows
+        if (cellW <= 0 || cellH <= 0) return
+
         grid.removeAllViews()
-        currentCategories.take(9).forEachIndexed { index, title ->
-            val tile = TextView(this).apply {
-                text = title
-                textSize = 14f
-                setTextColor(Color.WHITE)
-                gravity = Gravity.CENTER
-                isClickable = true
-                isFocusable = true
-                setBackgroundResource(
-                    if (index == currentCategoryIndex) R.drawable.ott_bg_rank_item_selected
-                    else R.drawable.ott_bg_rank_item_not_selected
-                )
-                val trophy = getDrawable(R.drawable.ic_default_rank_avatar)?.mutate()
-                trophy?.setBounds(0, 0, dp(42), dp(42))
-                setCompoundDrawables(null, trophy, null, null)
-                compoundDrawablePadding = dp(1)
-                setOnClickListener {
-                    if (index == currentCategoryIndex) return@setOnClickListener
-                    currentCategoryIndex = index
-                    browseMode = "rank"
-                    browseParam = rankPlaylistIds.getOrNull(index).orEmpty()
-                    browsePage = 0
-                    listTitle?.text = title
-                    updateRankCategoryGrid()
-                    loadBrowsePage()
-                }
-            }
-            installPressFeedback(tile)
-            grid.addView(tile, GridLayout.LayoutParams().apply {
-                rowSpec = GridLayout.spec(index / 3, 1f)
-                columnSpec = GridLayout.spec(index % 3, 1f)
-                width = 0
-                height = 0
-                setMargins(dp(3), dp(3), dp(3), dp(3))
+        categories.forEachIndexed { index, title ->
+            grid.addView(createRankTile(title, index), GridLayout.LayoutParams().apply {
+                rowSpec = GridLayout.spec(index / columns)
+                columnSpec = GridLayout.spec(index % columns)
+                width = cellW
+                height = cellH
+                setMargins(margin, margin, margin, margin)
             })
         }
+    }
+
+    private fun createRankTile(title: String, index: Int): TextView {
+        val tile = TextView(this).apply {
+            text = title
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            isClickable = true
+            isFocusable = true
+            setBackgroundResource(
+                if (index == currentCategoryIndex) R.drawable.ott_bg_rank_item_selected
+                else R.drawable.ott_bg_rank_item_not_selected
+            )
+            val trophy = getDrawable(R.drawable.ic_default_rank_avatar)?.mutate()
+            trophy?.setBounds(0, 0, dp(42), dp(42))
+            setCompoundDrawables(null, trophy, null, null)
+            compoundDrawablePadding = dp(1)
+            setOnClickListener {
+                if (index == currentCategoryIndex) return@setOnClickListener
+                currentCategoryIndex = index
+                browseMode = "rank"
+                browseParam = rankPlaylistIds.getOrNull(index).orEmpty()
+                browsePage = 0
+                listTitle?.text = title
+                updateRankCategoryGrid()
+                loadBrowsePage()
+            }
+        }
+        installPressFeedback(tile)
+        return tile
     }
 
     private fun loadCategoryPlaylists() {

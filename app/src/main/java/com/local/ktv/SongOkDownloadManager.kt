@@ -230,6 +230,7 @@ object SongOkDownloadManager {
         if (reportRange) synchronized(job) { job.inFlight[start] = 0L }
         try {
             connection.connectTimeout=15_000; connection.readTimeout=30_000
+            connection.setRequestProperty("User-Agent", IgebaApiClient.USER_AGENT)
             connection.setRequestProperty("Range","bytes=$start-$wireEnd")
             connection.setRequestProperty("Accept-Encoding","identity")
             val code=connection.responseCode
@@ -400,7 +401,16 @@ object SongOkDownloadManager {
         synchronized(job) { job.inFlight.clear() }
         val downloadSession = IgebaAccount.session ?: throw IOException("请先登录 i歌霸账号")
         val userId = downloadSession.userId
-        var address=IgebaApiClient.address(number, userId)
+        var address = try {
+            IgebaApiClient.address(number, userId)
+        } catch (error: IgebaApiClient.HttpStatusException) {
+            if (error.statusCode != 403 || job.cancelled.get()) throw error
+            IgebaAccount.relogin(downloadSession)
+            if (job.cancelled.get()) throw IOException("下载已暂停")
+            check(IgebaAccount.session?.userId == userId) { "账号已变更，请重试下载" }
+            android.util.Log.i("SongOkDownload", "歌曲取址返回 403，已恢复当前账号登录并重试")
+            IgebaApiClient.address(number, userId)
+        }
         val addressLock = Any()
         var exclusive=false
         var mediaTotal: Long? = null
